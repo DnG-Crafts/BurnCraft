@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BurnCraft</title>
+<style>
+  :root { --bg:#14161d; --card:#1e222c; --text:#e8eaf0; --muted:#8b92a5; --accent:#ff8a1e; --ok:#3ccf7a; --warn:#f5b83d; --bad:#e5484d; --bar:#2c3240; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f3f4f7; --card:#fff; --text:#1b1e26; --muted:#5f6678; --bar:#e2e5ec; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:560px; margin:0 auto; padding:16px; }
+  header { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+  header h1 { font-size:20px; margin:0; flex:1; }
+  .chip { padding:3px 10px; border-radius:999px; font-size:13px; font-weight:600; background:var(--bar); }
+  .chip.ok { background:color-mix(in srgb, var(--ok) 25%, transparent); color:var(--ok); }
+  .chip.run { background:color-mix(in srgb, var(--accent) 25%, transparent); color:var(--accent); }
+  .chip.warn { background:color-mix(in srgb, var(--warn) 25%, transparent); color:var(--warn); }
+  .chip.bad { background:color-mix(in srgb, var(--bad) 25%, transparent); color:var(--bad); }
+  .card { background:var(--card); border-radius:14px; padding:14px; margin-bottom:12px; }
+  .muted { color:var(--muted); font-size:14px; }
+  .bar { height:12px; border-radius:6px; background:var(--bar); overflow:hidden; margin:10px 0 6px; }
+  .bar > div { height:100%; width:0; background:var(--accent); transition:width .5s; }
+  .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; text-align:center; margin-top:8px; }
+  .stats b { display:block; font-size:20px; font-variant-numeric:tabular-nums; }
+  .buttons { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  button { font:inherit; font-weight:600; border:0; border-radius:12px; padding:16px; cursor:pointer; background:var(--bar); color:var(--text); }
+  button.stop { background:var(--bad); color:#fff; }
+  button:disabled { opacity:.4; cursor:default; }
+  img { width:100%; border-radius:10px; display:block; background:#000; }
+  form { display:flex; gap:8px; }
+  input { flex:1; font:inherit; font-size:22px; letter-spacing:.3em; text-align:center; padding:12px; border-radius:12px; border:1px solid var(--bar); background:var(--bg); color:var(--text); }
+  .hidden { display:none; }
+  .err { color:var(--bad); font-size:14px; min-height:1.4em; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="machine">BurnCraft</h1>
+    <span id="chip" class="chip">…</span>
+  </header>
+
+  <section id="login" class="card hidden">
+    <p>Enter the PIN shown in BurnCraft under <b>Settings → Remote monitoring</b>.</p>
+    <form id="pinform">
+      <input id="pin" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="••••••" aria-label="PIN">
+      <button type="submit">Open</button>
+    </form>
+    <p id="pinerr" class="err"></p>
+  </section>
+
+  <div id="app" class="hidden">
+    <section class="card">
+      <div id="jobtitle"><b>No job running</b></div>
+      <div class="bar"><div id="fill"></div></div>
+      <div id="what" class="muted"></div>
+      <div class="stats">
+        <div><b id="elapsed">–</b><span class="muted">elapsed</span></div>
+        <div><b id="remaining">–</b><span class="muted">remaining</span></div>
+        <div><b id="pos">–</b><span class="muted">position</span></div>
+      </div>
+    </section>
+
+    <section class="card buttons">
+      <button id="pause" disabled>Pause</button>
+      <button id="stop" class="stop" disabled>Stop</button>
+    </section>
+
+    <section id="camcard" class="card hidden">
+      <img id="cam" alt="Live camera view of the laser bed">
+    </section>
+
+    <section class="card">
+      <div id="message" class="muted">Connecting…</div>
+    </section>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let pin = '';
+try { pin = localStorage.getItem('burncraft-pin') || ''; } catch (e) {}
+let wasRunning = false, status = null, camUrl = null, failures = 0;
+
+function fmt(s) {
+  if (s == null || !isFinite(s)) return '–';
+  s = Math.max(0, Math.round(s));
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = s % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}` : `${m}:${String(sec).padStart(2, '0')}`;
+}
+
+async function api(path, method = 'GET') {
+  const r = await fetch(path, { method, headers: { 'X-Pin': pin }, cache: 'no-store' });
+  if (r.status === 401) { showLogin(pin ? 'Wrong PIN' : ''); throw new Error('pin'); }
+  return r;
+}
+
+function savePin(value) {
+  pin = value;
+  try { localStorage.setItem('burncraft-pin', pin); } catch (e) {}
+}
+
+// Pause/Resume/Stop always need the PIN, even when viewing doesn't: ask for it on first use.
+async function control(path) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (!pin) {
+      const entered = window.prompt('Enter the PIN shown in BurnCraft (Settings → Remote monitoring) to control the laser:');
+      if (!entered) return;
+      savePin(entered.trim());
+    }
+    const r = await fetch(path, { method: 'POST', headers: { 'X-Pin': pin }, cache: 'no-store' });
+    if (r.status !== 401) { poll(); return; }
+    savePin('');
+    alert('Wrong PIN.');
+  }
+}
+
+function showLogin(err) {
+  $('login').classList.remove('hidden');
+  $('app').classList.add('hidden');
+  $('pinerr').textContent = err || '';
+  $('chip').textContent = 'Locked'; $('chip').className = 'chip';
+}
+
+function notifyFinished() {
+  document.title = '✔ Job finished – BurnCraft';
+  if (navigator.vibrate) navigator.vibrate([300, 150, 300]);
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    [0, 0.25].forEach((t) => { const o = ctx.createOscillator(); o.frequency.value = 880; o.connect(ctx.destination); o.start(ctx.currentTime + t); o.stop(ctx.currentTime + t + 0.15); });
+  } catch (e) {}
+}
+
+function render(s) {
+  status = s;
+  $('machine').textContent = s.machine || 'BurnCraft';
+  const chip = $('chip');
+  if (!s.connected) { chip.textContent = 'Disconnected'; chip.className = 'chip bad'; }
+  else if (s.job_running && s.paused) { chip.textContent = 'Paused'; chip.className = 'chip warn'; }
+  else if (s.job_running) { chip.textContent = 'Running'; chip.className = 'chip run'; }
+  else { chip.textContent = 'Ready'; chip.className = 'chip ok'; }
+
+  let fraction = null;
+  if (s.progress) fraction = s.progress[0];
+  else if (s.job_running && s.elapsed_s != null && s.estimate_s) fraction = Math.min(1, s.elapsed_s / s.estimate_s);
+  $('fill').style.width = fraction == null ? (s.job_running ? '0%' : '0%') : (fraction * 100).toFixed(1) + '%';
+  $('jobtitle').innerHTML = s.job_running ? '<b>Job running</b>' : (s.elapsed_s != null ? '<b>Last job finished</b>' : '<b>No job running</b>');
+  $('what').textContent = s.progress ? `${s.progress[1]} ${(s.progress[0] * 100).toFixed(0)}%` : (s.job_running && s.end_not_reported ? 'This controller doesn\'t report when it finishes; time left is an estimate.' : (s.description || ''));
+  $('elapsed').textContent = fmt(s.elapsed_s);
+  $('remaining').textContent = s.job_running && s.estimate_s != null && s.elapsed_s != null ? fmt(s.estimate_s - s.elapsed_s) : '–';
+  $('pos').textContent = s.position ? `${s.position[0].toFixed(0)}, ${s.position[1].toFixed(0)}` : '–';
+  $('message').textContent = s.message || (s.connected ? s.state : 'The laser isn\'t connected in BurnCraft.');
+  $('pause').disabled = !s.connected;
+  $('pause').textContent = s.paused ? 'Resume' : 'Pause';
+  $('stop').disabled = !s.connected;
+  $('camcard').classList.toggle('hidden', !s.camera);
+
+  if (wasRunning && !s.job_running) notifyFinished();
+  if (s.job_running) document.title = `${fraction != null ? Math.round(fraction * 100) + '% · ' : ''}BurnCraft`;
+  wasRunning = s.job_running;
+}
+
+async function poll() {
+  // Try without a PIN first: viewing may be open. A 401 shows the PIN screen.
+  try {
+    const r = await api('/api/status');
+    const text = await r.text();
+    $('login').classList.add('hidden'); $('app').classList.remove('hidden');
+    failures = 0;
+    if (text) render(JSON.parse(text));
+  } catch (e) {
+    if (e.message !== 'pin' && ++failures > 2) { $('chip').textContent = 'Offline'; $('chip').className = 'chip bad'; $('message').textContent = 'Can\'t reach BurnCraft. Is it still running, with remote monitoring on?'; }
+  }
+}
+
+async function camera() {
+  if (!status || !status.camera || document.hidden) return;
+  try {
+    const r = await api('/api/camera.jpg');
+    if (!r.ok) return;
+    const url = URL.createObjectURL(await r.blob());
+    $('cam').src = url;
+    if (camUrl) URL.revokeObjectURL(camUrl);
+    camUrl = url;
+  } catch (e) {}
+}
+
+$('pinform').addEventListener('submit', (e) => {
+  e.preventDefault();
+  savePin($('pin').value.trim());
+  poll();
+});
+$('pause').addEventListener('click', () => control(status && status.paused ? '/api/resume' : '/api/pause').catch(() => {}));
+$('stop').addEventListener('click', () => { if (confirm('Stop the job now?')) control('/api/stop').catch(() => {}); });
+
+poll();
+setInterval(poll, 1000);
+setInterval(camera, 1500);
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+[package]
+name = "bc-grbl"
+edition = "2024"
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serialport = "4.10.1"

@@ -1,0 +1,9 @@
+[package]
+name = "bc-galvo"
+edition = "2024"
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+rusb = { version = "0.9.4", features = ["vendored"] }
+serde = { version = "1.0.229", features = ["derive"] }

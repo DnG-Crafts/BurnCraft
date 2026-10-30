@@ -1,0 +1,15 @@
+[package]
+name = "bc-camera"
+edition = "2024"
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+bc-geom = { version = "0.1.0", path = "../bc-geom" }
+nokhwa = { version = "0.10.11", features = ["input-native", "output-threaded"] }
+serde = { version = "1.0.229", features = ["derive"] }
+
+# macOS: listing every video device (USB cameras included) through AVFoundation directly. The same
+# version nokhwa already uses.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2.7"

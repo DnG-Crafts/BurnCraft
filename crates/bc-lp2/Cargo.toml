@@ -1,0 +1,8 @@
+[package]
+name = "bc-lp2"
+edition = "2024"
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serialport = "4.10.1"

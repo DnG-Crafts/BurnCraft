@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+license = "GPL-3.0-or-later"
+
+# Optimise dependencies (image decoding, geometry, fonts) even in debug builds,
+# so the app stays responsive during development.
+[profile.dev.package."*"]
+opt-level = 2
+
+# Our own number-crunching crates too: photos become millions of runs, which is far too slow
+# unoptimised. (The app crate stays quick to rebuild.)
+[profile.dev.package.bc-geom]
+opt-level = 2
+
+[profile.dev.package.bc-raster]
+opt-level = 2
+
+[profile.dev.package.bc-job]
+opt-level = 2

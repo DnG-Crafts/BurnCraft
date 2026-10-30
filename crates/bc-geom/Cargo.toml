@@ -1,0 +1,11 @@
+[package]
+name = "bc-geom"
+edition = "2024"
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+geo = "0.33.1"
+kurbo = { version = "0.13.1", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+linesweeper = "0.5"
