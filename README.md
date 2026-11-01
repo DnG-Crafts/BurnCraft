@@ -67,12 +67,12 @@ It drives **Ruida** DSP controllers (most CO2 lasers), **G-code** machines (GRBL
 | Controller | Connection | Typical machines | Status |
 |---|---|---|---|
 | **Ruida** RDC644x / 654x (incl. RDC6445G), RDC634XG, RDL9635 | Ethernet (UDP) or USB | Most CO2 laser cutters | ✅ Ethernet tested on hardware · USB untested |
-| **GRBL** 1.1 (M4 dynamic or M3 constant power) | USB serial | Diode lasers, hobby CNC lasers, LaserPecker LP2 Plus | ⚠️ Untested on hardware |
+| **GRBL** 1.1 (M4 dynamic or M3 constant power) | USB serial | Diode lasers, hobby CNC lasers, LaserPecker LP2 Plus | ✅ Tested on hardware |
 | **Marlin** (laser feature) | USB serial | 3D-printer-based lasers | ⚠️ Untested on hardware |
 | **Smoothieware** | USB serial | K40 upgrades, Smoothieboard machines | ⚠️ Untested on hardware |
 | **Custom G-code** | USB serial | Anything that takes G-code, with your own commands | ⚠️ Untested on hardware |
 | **BJJCZ / LMC galvo** (EZCad2 boards) | USB | Fiber, UV and CO2 galvo markers | ⚠️ Untested on hardware |
-| **LaserPecker 2** (its own USB protocol) | USB serial (CH340) | LaserPecker LP2 | ⚠️ Untested on hardware |
+| **LaserPecker 2** (its own USB protocol) | USB serial (CH340) | LaserPecker LP2 | ✅ Tested on hardware · Roller/Trolley still need work|
 
 If you run BurnCraft on any of the untested controllers, a report of how it went (good or bad) is very welcome. Please [open an issue](../../issues).
 
