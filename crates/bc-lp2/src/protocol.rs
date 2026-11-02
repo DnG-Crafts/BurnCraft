@@ -19,9 +19,6 @@ pub const QUERY_SERIAL: u8 = 0x05;
 /// Query: asked on connecting; the reply is empty.
 pub const QUERY_08: u8 = 0x08;
 
-/// What the app writes to the machine's settings each time it connects.
-pub const CONNECT_SETTINGS: [u8; 21] = [0x06, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-
 /// 16-bit sum of the payload bytes.
 pub fn checksum(payload: &[u8]) -> u16 {
     payload.iter().fold(0u16, |s, &b| s.wrapping_add(b as u16))
@@ -67,15 +64,16 @@ pub fn preview(w: u16, h: u16, x: u16, y: u16) -> Vec<u8> {
     p
 }
 
-/// Starts the uploaded job: power and speed in percent, the job's id (as in its file header) and
-/// its top-left corner in whole mm. The machine echoes `01 01`.
-pub fn start(job: u32, power: u8, speed: u8, at_mm: (u16, u16)) -> Vec<u8> {
+/// Starts the uploaded job: power and speed in percent, the job's id (as in its file header), its
+/// top-left corner in whole mm, and how many passes to run. The machine echoes `01 01`.
+pub fn start(job: u32, power: u8, speed: u8, at_mm: (u16, u16), passes: u16) -> Vec<u8> {
     let mut p = vec![0x01, 0x01, power, speed];
     p.extend_from_slice(&job.to_be_bytes());
     p.extend_from_slice(&at_mm.0.to_be_bytes());
     p.extend_from_slice(&at_mm.1.to_be_bytes());
+    p.extend_from_slice(&passes.max(1).to_be_bytes());
     // Always the same in the captures.
-    p.extend_from_slice(&[0x00, 0x01, 0x00, 0x07, 0xD0, 0x01, 0x00, 0x3C, 0x00, 0x00, 0x01]);
+    p.extend_from_slice(&[0x00, 0x07, 0xD0, 0x01, 0x00, 0x3C, 0x00, 0x00, 0x01]);
     p
 }
 
@@ -168,12 +166,12 @@ mod tests {
     fn commands_match_the_captures() {
         assert_eq!(frame(&query(QUERY_VERSION)), hex("aa bb 08 00 03 00 00 00 00 00 03"));
         assert_eq!(frame(&idle()), hex("aa bb 08 ff 00 00 00 00 00 00 ff"));
-        assert_eq!(frame(&CONNECT_SETTINGS), hex("aa bb 17 06 01 01 01 01 00 00 00 01 01 00 00 00 00 00 00 00 00 00 00 00 00 0c"));
         assert_eq!(frame(&begin_file(0xDA)), hex("aa bb 09 05 01 00 00 00 da 00 00 e0"));
         assert_eq!(frame(&begin_file(0x4901)), hex("aa bb 09 05 01 00 00 49 01 00 00 50"));
         assert_eq!(frame(&preview(0x178, 0x10E, 0x6B, 0x91)), hex("aa bb 11 02 02 01 78 01 0e 00 6b 00 91 00 04 01 07 d0 02 64"));
-        assert_eq!(frame(&start(0x547F8A85, 100, 0x62, (10, 15))), hex("aa bb 19 01 01 64 62 54 7f 8a 85 00 0a 00 0f 00 01 00 07 d0 01 00 3c 00 00 01 03 d9"));
-        assert_eq!(frame(&start(0xA756D19E, 100, 0x47, (45, 44))), hex("aa bb 19 01 01 64 47 a7 56 d1 9e 00 2d 00 2c 00 01 00 07 d0 01 00 3c 00 00 01 04 88"));
+        assert_eq!(frame(&start(0x547F8A85, 100, 0x62, (10, 15), 1)), hex("aa bb 19 01 01 64 62 54 7f 8a 85 00 0a 00 0f 00 01 00 07 d0 01 00 3c 00 00 01 03 d9"));
+        assert_eq!(start(0x02675D3F, 100, 0x62, (42, 42), 2), hex("01 01 64 62 02 67 5d 3f 00 2a 00 2a 00 02 00 07 d0 01 00 3c 00 00 01"), "two passes");
+        assert_eq!(frame(&start(0xA756D19E, 100, 0x47, (45, 44), 1)), hex("aa bb 19 01 01 64 47 a7 56 d1 9e 00 2d 00 2c 00 01 00 07 d0 01 00 3c 00 00 01 04 88"));
     }
 
     #[test]

@@ -69,6 +69,12 @@ pub struct LaserSettings {
     pub ruida_model: RuidaModel,
     /// Connect to the Ruida over USB (its serial port) instead of Ethernet.
     pub ruida_usb: bool,
+    /// Ruida: the machine has a Z axis (usually a table that moves up and down).
+    pub ruida_z: bool,
+    /// Ruida: the machine has a U axis (a 4th axis).
+    pub ruida_u: bool,
+    /// How far each Z jog button moves the laser (G-code machines), mm.
+    pub z_jog_step: f64,
     pub ip: String,
     pub serial_port: String,
     pub baud: u32,
@@ -77,6 +83,8 @@ pub struct LaserSettings {
     pub dialect: Dialect,
     pub custom_gcode: CustomGcode,
     pub galvo: GalvoSettings,
+    /// The LaserPecker 2's own settings, written to it when connecting.
+    pub lp2: bc_lp2::Settings,
     pub origin: OriginCorner,
     /// Rapid speed in mm/s, for time estimates, jogging and framing.
     pub rapid_speed: f64,
@@ -93,6 +101,13 @@ pub struct LaserSettings {
     pub air_m7: bool,
     /// G-code: raise DTR when opening the port (resets Arduino-style boards).
     pub dtr: bool,
+    /// G-code: the machine has a Z axis, used for each layer's Z offset and step per pass.
+    pub z_axis: bool,
+    /// Z axis: positive Z moves the head down (or the bed up).
+    pub z_reversed: bool,
+    /// Z axis: move Z only relative to where it was focused (and come back), rather than to
+    /// absolute positions with 0 at focus.
+    pub z_relative: bool,
     /// Home the machine as soon as it connects.
     pub home_on_connect: bool,
     /// One-click command buttons (G-code machines).
@@ -130,6 +145,44 @@ impl StartFrom {
             StartFrom::UserOrigin => "User Origin",
         }
     }
+}
+
+/// The LaserPecker 2's own settings, as rows of a two-column grid.
+fn lp2_settings_rows(ui: &mut egui::Ui, s: &mut bc_lp2::Settings) {
+    ui.label("Work mode");
+    egui::ComboBox::from_id_salt("lp2-mode").selected_text(s.mode.label()).show_ui(ui, |ui| {
+        for m in bc_lp2::WorkMode::ALL {
+            ui.selectable_value(&mut s.mode, m, m.label());
+        }
+    });
+    ui.end_row();
+    let rows: [(&str, &str, &mut bool); 5] = [
+        ("Path optimization", "Order line work for a quicker job", &mut s.path_optimization),
+        ("Beep", "Beep when work starts and ends", &mut s.beep),
+        ("Reverse direction", "Engrave in reverse, for handheld work", &mut s.reverse_direction),
+        ("Touch buttons", "The preview and stop buttons on the laser unit", &mut s.touch_buttons),
+        ("Batch engraving button", "The batch engraving button accessory", &mut s.batch_button),
+    ];
+    for (label, about, value) in rows {
+        ui.label(label).on_hover_text(about);
+        ui.checkbox(value, "").on_hover_text(about);
+        ui.end_row();
+    }
+    ui.label("Free mode").on_hover_text("Lets the laser fire without its protective cover");
+    let mut free = s.free_mode;
+    if ui.checkbox(&mut free, "").on_hover_text("Lets the laser fire without its protective cover").changed() {
+        s.free_mode = !free
+            || rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("Free mode")
+                .set_description(
+                    "Free mode lets the LaserPecker 2 fire without its protective cover in place.\n\nThe beam can permanently damage eyes and skin and can start fires. Wear safety glasses rated for the laser's wavelength, keep people and pets away, and never leave it running unattended.\n\nTurn free mode on?",
+                )
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show()
+                == rfd::MessageDialogResult::Yes;
+    }
+    ui.end_row();
 }
 
 /// A compact 3 × 3 picker for an origin point (0..9, row by row from the top-left).
@@ -347,6 +400,9 @@ impl Default for LaserSettings {
             controller: ControllerKind::Ruida,
             ruida_model: RuidaModel::default(),
             ruida_usb: false,
+            ruida_z: false,
+            ruida_u: false,
+            z_jog_step: 1.0,
             ip: "192.168.1.100".into(),
             serial_port: String::new(),
             baud: 115_200,
@@ -354,6 +410,7 @@ impl Default for LaserSettings {
             dialect: Dialect::Grbl,
             custom_gcode: CustomGcode::default(),
             galvo: GalvoSettings::default(),
+            lp2: bc_lp2::Settings::default(),
             origin: OriginCorner::TopRight,
             rapid_speed: 300.0,
             jog_step: 10.0,
@@ -364,6 +421,9 @@ impl Default for LaserSettings {
             end_gcode: String::new(),
             air_m7: false,
             dtr: true,
+            z_axis: false,
+            z_reversed: false,
+            z_relative: true,
             home_on_connect: false,
             macros: Vec::new(),
             rotary: Rotary::default(),
@@ -405,6 +465,10 @@ pub struct Laser {
     units: Units,
     /// The Machine Settings (GRBL) window.
     pub grbl_config: crate::grbl_config::GrblConfig,
+    /// A Ruida keypad key held down from the Move tab, and whether its button was drawn this frame
+    /// (if not, it's released: the button can't see the mouse let go).
+    held_jog: Option<bc_ruida::JogKey>,
+    held_seen: bool,
 }
 
 impl Laser {
@@ -414,7 +478,7 @@ impl Laser {
         let store = store.unwrap_or_else(|| DeviceStore { profiles: legacy.into_iter().map(|settings| DeviceProfile { name: "My laser".into(), settings }).collect(), active: 0 });
         let active = store.active.min(store.profiles.len().saturating_sub(1));
         let settings = store.profiles.get(active).map(|p| p.settings.clone()).unwrap_or_default();
-        Self { settings, profiles: store.profiles, active, pending_bed: None, job_estimate: Default::default(), device, ports: bc_grbl::list_ports(), console_input: String::new(), goto: (0.0, 0.0), editing: false, wizard: None, finder: None, units: Units::default(), grbl_config: Default::default() }
+        Self { settings, profiles: store.profiles, active, pending_bed: None, job_estimate: Default::default(), device, ports: bc_grbl::list_ports(), console_input: String::new(), goto: (0.0, 0.0), editing: false, wizard: None, finder: None, units: Units::default(), grbl_config: Default::default(), held_jog: None, held_seen: false }
     }
 
     /// The device list for saving.
@@ -519,6 +583,11 @@ impl Laser {
 
     /// Applies controller events. Returns a new work area: reported by the controller, or from a newly selected machine.
     pub fn poll(&mut self) -> Option<(f64, f64)> {
+        if !std::mem::take(&mut self.held_seen)
+            && let Some(key) = self.held_jog.take()
+        {
+            self.device.send(DeviceCmd::JogKey(key, false));
+        }
         let reported = self.device.poll();
         if std::mem::take(&mut self.device.just_connected) && self.settings.home_on_connect {
             self.device.send(DeviceCmd::Home);
@@ -577,6 +646,7 @@ impl Laser {
             end_gcode: s.end_gcode.clone(),
             air_m7: s.air_m7,
             y_as_a: self.rotary_on_a(),
+            z: s.z_axis.then_some(bc_grbl::ZAxis { relative: s.z_relative, reversed: s.z_reversed }),
         }
     }
 
@@ -698,7 +768,7 @@ impl Laser {
         if self.rotary_on_a() {
             // Jogging moves X/Y only, so trace the frame as a laser-off job on X/A.
             let ring = vec![min, (max.0, min.1), max, (min.0, max.1), min];
-            let layer = MachineLayer { speed: self.settings.rapid_speed, min_power: 0.0, max_power: 0.0, air_assist: false, frequency: 30.0, color: [0, 0, 0], raster: false, passes: 1, paths: vec![(ring, 0.0)] };
+            let layer = MachineLayer { speed: self.settings.rapid_speed, min_power: 0.0, max_power: 0.0, air_assist: false, frequency: 30.0, color: [0, 0, 0], raster: false, passes: 1, interval: 0.1, z_offset: 0.0, z_step: 0.0, delay_on: 0.0, delay_off: 0.0, paths: vec![(ring, 0.0)] };
             self.device.send(DeviceCmd::Run(vec![layer]));
         } else {
             self.device.send(DeviceCmd::Frame(min, max, self.settings.rapid_speed));
@@ -765,10 +835,13 @@ impl Laser {
         Ok(confirmed)
     }
 
-    /// Moves the head (laser off) to a design point.
-    pub fn move_to_design(&self, bed: (f64, f64), p: Point) {
-        let (x, y) = self.machine(bed).to_machine(p);
+    /// Moves the head (laser off) to a design point, or as near as the work area allows. Returns
+    /// false if the point was outside it, so the head stopped at the edge.
+    pub fn move_to_design(&self, bed: (f64, f64), p: Point) -> bool {
+        let wanted = self.machine(bed).to_machine(p);
+        let (x, y) = self.inside_bed(bed, wanted);
         self.device.send(DeviceCmd::MoveTo(x, y, self.settings.rapid_speed));
+        (x, y) == wanted
     }
 
     /// Moves the head to the machine origin (0, 0).
@@ -813,11 +886,25 @@ impl Laser {
         }
     }
 
-    /// Jog by a design-space offset (mm), converted to the machine's axis directions.
+    /// Jog by a design-space offset (mm), converted to the machine's axis directions. When the
+    /// head's position is known, the move stops at the edge of the work area.
     fn jog(&self, bed: (f64, f64), dx: f64, dy: f64) {
         let cfg = self.machine(bed);
         let (a, b) = (cfg.to_machine(Point::ORIGIN), cfg.to_machine(Point::new(dx, dy)));
-        self.device.send(DeviceCmd::JogBy(b.0 - a.0, b.1 - a.1, self.settings.rapid_speed));
+        let (mut dx, mut dy) = (b.0 - a.0, b.1 - a.1);
+        if let Some(s) = &self.device.state {
+            let (x, y) = self.inside_bed(bed, (s.x + dx, s.y + dy));
+            (dx, dy) = (x - s.x, y - s.y);
+        }
+        self.device.send(DeviceCmd::JogBy(dx, dy, self.settings.rapid_speed));
+    }
+
+    /// Keeps a manual move (machine mm) inside the work area. With a rotary, Y turns the object,
+    /// so it isn't limited. Jobs are checked against the work area before they're sent.
+    fn inside_bed(&self, bed: (f64, f64), (x, y): (f64, f64)) -> (f64, f64) {
+        let (w, h) = self.machine(bed).bed;
+        let y = if self.rotary_scale().is_some() { y } else { y.clamp(0.0, h) };
+        (x.clamp(0.0, w), y)
     }
 
     pub fn connect(&mut self) {
@@ -852,7 +939,7 @@ impl Laser {
                 self.device.message = Some("Connecting to the galvo over USB…".into());
             }
             ControllerKind::Lp2 => {
-                self.device.send(DeviceCmd::ConnectLp2 { port: s.serial_port.clone() });
+                self.device.send(DeviceCmd::ConnectLp2 { port: s.serial_port.clone(), settings: s.lp2 });
                 self.device.message = Some(format!("Connecting on {}…", s.serial_port));
             }
         }
@@ -1001,6 +1088,69 @@ impl Laser {
     }
 
     /// The Move tab: jogging, position readout and go-to.
+    /// Z (and Ruida U) jog buttons, for machines that have those axes. G-code machines step by the
+    /// Z distance; a Ruida moves while a button is held, like its keypad.
+    fn z_u_buttons(&mut self, ui: &mut egui::Ui, units: Units) {
+        let s = &self.settings;
+        let b = |t: &str| egui::Button::new(t).min_size(egui::vec2(60.0, 26.0));
+        match s.controller {
+            ControllerKind::Grbl if s.z_axis => {
+                let (step, sign, speed) = (s.z_jog_step, if s.z_reversed { -1.0 } else { 1.0 }, s.rapid_speed.min(10.0));
+                ui.horizontal(|ui| {
+                    ui.label("Z");
+                    if ui.add(b("⏶ Up")).on_hover_text("Raise the laser").clicked() {
+                        self.device.send(DeviceCmd::JogZ(sign * step, speed));
+                    }
+                    if ui.add(b("⏷ Down")).on_hover_text("Lower the laser").clicked() {
+                        self.device.send(DeviceCmd::JogZ(-sign * step, speed));
+                    }
+                    ui.label("by");
+                    units.drag(ui, &mut self.settings.z_jog_step, 0.01..=50.0);
+                });
+            }
+            ControllerKind::Ruida if s.ruida_z || s.ruida_u => {
+                let (z, u) = (s.ruida_z, s.ruida_u);
+                if z {
+                    ui.horizontal(|ui| {
+                        ui.label("Z");
+                        self.hold_button(ui, "⏶ Up", bc_ruida::JogKey::ZUp);
+                        self.hold_button(ui, "⏷ Down", bc_ruida::JogKey::ZDown);
+                        ui.weak("hold to move");
+                    });
+                }
+                if u {
+                    ui.horizontal(|ui| {
+                        ui.label("U");
+                        self.hold_button(ui, "⏴ Back", bc_ruida::JogKey::UBackward);
+                        self.hold_button(ui, "Forward ⏵", bc_ruida::JogKey::UForward);
+                        ui.weak("hold to move");
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A button that holds a Ruida keypad key down while it's pressed, and releases it after.
+    fn hold_button(&mut self, ui: &mut egui::Ui, label: &str, key: bc_ruida::JogKey) {
+        let r = ui.add(egui::Button::new(label).min_size(egui::vec2(60.0, 26.0))).on_hover_text("Moves while held down");
+        let down = r.is_pointer_button_down_on() && ui.is_enabled();
+        if down && self.held_jog != Some(key) {
+            if let Some(other) = self.held_jog.take() {
+                self.device.send(DeviceCmd::JogKey(other, false));
+            }
+            self.device.send(DeviceCmd::JogKey(key, true));
+            self.held_jog = Some(key);
+        } else if !down && self.held_jog == Some(key) {
+            self.device.send(DeviceCmd::JogKey(key, false));
+            self.held_jog = None;
+        }
+        if self.held_jog == Some(key) {
+            self.held_seen = true;
+            ui.ctx().request_repaint();
+        }
+    }
+
     pub fn move_panel(&mut self, ui: &mut egui::Ui, bed: (f64, f64), units: Units, y_up: bool) {
         let connected = self.device.connected;
         if let Some(s) = &self.device.state {
@@ -1027,6 +1177,7 @@ impl Laser {
                 ui.label("");
                 ui.end_row();
             });
+            self.z_u_buttons(ui, units);
             ui.horizontal(|ui| {
                 ui.label("Distance");
                 units.drag(ui, &mut self.settings.jog_step, 0.1..=500.0);
@@ -1040,7 +1191,9 @@ impl Laser {
                 units.drag(ui, &mut self.goto.1, -5000.0..=5000.0);
                 if ui.button("Go").clicked() {
                     let y = if y_up { bed.1 - self.goto.1 } else { self.goto.1 };
-                    self.move_to_design(bed, Point::new(self.goto.0, y));
+                    if !self.move_to_design(bed, Point::new(self.goto.0, y)) {
+                        self.device.message = Some("That's outside the work area: the head went to the nearest edge instead".into());
+                    }
                 }
             });
             ui.horizontal(|ui| {
@@ -1147,6 +1300,12 @@ impl Laser {
                                     ui.radio_value(&mut self.settings.ruida_usb, true, "USB");
                                 });
                                 ui.end_row();
+                                ui.label("Extra axes");
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut self.settings.ruida_z, "Z axis").on_hover_text("A table (or head) that moves up and down: adds Z buttons to the Move tab");
+                                    ui.checkbox(&mut self.settings.ruida_u, "U axis").on_hover_text("A 4th axis: adds U buttons to the Move tab");
+                                });
+                                ui.end_row();
                                 if self.settings.ruida_usb {
                                     self.port_row(ui);
                                 } else {
@@ -1178,6 +1337,15 @@ impl Laser {
                                 ui.end_row();
                                 ui.label("Full-power S value").on_hover_text("GRBL: $30 (usually 1000). Marlin: 255. Smoothieware: 1.");
                                 ui.add(egui::DragValue::new(&mut self.settings.s_max).range(0.01..=100_000.0));
+                                ui.end_row();
+                                ui.label("Z axis").on_hover_text("The laser can move up and down: layers get a Z offset and a Z step per pass");
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut self.settings.z_axis, "Enabled");
+                                    if self.settings.z_axis {
+                                        ui.checkbox(&mut self.settings.z_relative, "Relative moves").on_hover_text("Move Z only relative to where you focused it, and come back after the job. Off: Z positions are absolute, with 0 at focus.");
+                                        ui.checkbox(&mut self.settings.z_reversed, "Reversed").on_hover_text("Tick if positive Z moves the laser down (or the bed up)");
+                                    }
+                                });
                                 ui.end_row();
                             }
                             ControllerKind::Galvo => {
@@ -1218,7 +1386,13 @@ impl Laser {
                 });
                 egui::Grid::new("device-grid-2").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     if self.settings.controller == ControllerKind::Lp2 {
-                        // A fixed field, and speeds set as depth: nothing more to set.
+                        // A fixed field and speeds set as depth; what's left are the machine's own
+                        // settings, sent when connecting and as soon as one is changed.
+                        let before = self.settings.lp2;
+                        lp2_settings_rows(ui, &mut self.settings.lp2);
+                        if self.settings.lp2 != before && connected {
+                            self.device.send(DeviceCmd::Lp2Settings(self.settings.lp2));
+                        }
                         return;
                     }
                     ui.label("Speed units");
@@ -1639,6 +1813,11 @@ pub fn to_machine_job(job: &Job, to_machine: impl Fn(Point) -> (f64, f64)) -> Ve
             color: l.settings.rgb(l.index),
             raster: matches!(l.settings.mode, bc_doc::LayerMode::Fill | bc_doc::LayerMode::Image),
             passes: l.settings.passes.max(1),
+            interval: l.settings.interval,
+            z_offset: l.settings.z_offset,
+            z_step: l.settings.z_step,
+            delay_on: l.settings.delay_on,
+            delay_off: l.settings.delay_off,
             paths: l.paths.iter().map(|p| (p.points.iter().map(|q| to_machine(*q)).collect(), p.power)).collect(),
         })
         .collect()
@@ -1696,6 +1875,22 @@ mod tests {
 
     fn laser(settings: LaserSettings) -> Laser {
         Laser::new(None, Some(settings), Device::spawn(egui::Context::default()))
+    }
+
+    #[test]
+    fn manual_moves_stay_inside_the_work_area() {
+        let s = LaserSettings { controller: ControllerKind::Grbl, origin: OriginCorner::TopLeft, ..LaserSettings::default() };
+        let l = laser(s.clone());
+        let bed = (300.0, 300.0);
+        assert_eq!(l.inside_bed(bed, (305.0, 300.0)), (300.0, 300.0), "a click just past the edge stops at it");
+        assert_eq!(l.inside_bed(bed, (-4.0, 320.0)), (0.0, 300.0));
+        assert_eq!(l.inside_bed(bed, (150.0, 120.0)), (150.0, 120.0));
+        assert!(!l.move_to_design(bed, Point::new(305.0, 150.0)));
+        assert!(l.move_to_design(bed, Point::new(100.0, 150.0)));
+        // With a rotary, Y turns the object, so only X is limited.
+        let mut r = s;
+        r.rotary.enabled = true;
+        assert_eq!(laser(r).inside_bed(bed, (305.0, 420.0)), (300.0, 420.0));
     }
 
     fn square_job(y0: f64) -> Job {

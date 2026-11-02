@@ -372,6 +372,17 @@ impl Grbl {
         moved
     }
 
+    /// Relative Z move in mm at `feed` mm/min, laser off.
+    pub fn jog_z(&mut self, dz: f64, feed: f64) -> Result<()> {
+        if self.dialect.is_grbl() {
+            return self.command(&format!("$J=G91 G21 Z{dz:.3} F{feed:.0}"), Duration::from_secs(2));
+        }
+        self.command("G91", Duration::from_secs(2))?;
+        let moved = self.command(&format!("G0 Z{dz:.3} F{feed:.0}"), Duration::from_secs(10));
+        self.command("G90", Duration::from_secs(2))?;
+        moved
+    }
+
     /// Absolute move (work coordinates) in mm at `feed` mm/min, laser off.
     pub fn jog_to(&mut self, x: f64, y: f64, feed: f64) -> Result<()> {
         if self.dialect.is_grbl() {

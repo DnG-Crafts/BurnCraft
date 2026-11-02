@@ -13,6 +13,7 @@ pub mod lightburn;
 pub mod metafile;
 pub mod pdf_import;
 pub mod psd;
+pub mod rld;
 pub mod single_line;
 pub mod svg;
 

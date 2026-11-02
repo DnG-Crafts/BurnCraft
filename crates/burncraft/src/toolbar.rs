@@ -27,7 +27,8 @@ impl BurnCraftApp {
     }
 
     pub(crate) fn top_toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        // Wraps onto a second row when the window is too narrow for every button.
+        ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             for (icon, cmd) in [(Icon::New, Command::New), (Icon::Open, Command::Open), (Icon::Save, Command::Save), (Icon::Import, Command::Import), (Icon::Export, Command::ExportSvg)] {
                 self.command_icon(ui, icon, cmd, TOP);
@@ -76,7 +77,32 @@ impl BurnCraftApp {
             }
             self.command_icon(ui, Icon::DistributeH, Command::Distribute(true), TOP);
             self.command_icon(ui, Icon::DistributeV, Command::Distribute(false), TOP);
+            ui.separator();
+            self.view_toggles(ui);
         });
+    }
+
+    /// View options as on/off buttons (the same settings as the View menu).
+    fn view_toggles(&mut self, ui: &mut egui::Ui) {
+        let p = &mut self.prefs;
+        for (icon, value, tip) in [
+            (Icon::SnapGrid, &mut p.snap_to_grid, "Snap to Grid"),
+            (Icon::SnapObjects, &mut p.snap_to_objects, "Snap to Objects: corners, centres and edges of other shapes"),
+            (Icon::SmartGuides, &mut p.smart_guides, "Smart Guides: line shapes up with other shapes, the bed and guides while moving"),
+        ] {
+            if icons::button(ui, icon, TOP, *value, true, tip).clicked() {
+                *value = !*value;
+            }
+        }
+        let order = &mut self.canvas.show_cut_order;
+        if icons::button(ui, Icon::CutOrder, TOP, *order, true, "Show Cut Order: number each cut in the order it runs, with its direction").clicked() {
+            *order = !*order;
+        }
+        let pictures = self.doc.shapes.iter().any(|s| matches!(s.kind, bc_doc::ShapeKind::Image { .. }));
+        let tip = if pictures { "Burn Preview: show pictures dithered as the laser will burn them" } else { "Burn Preview shows pictures as they'll burn; there are no pictures in this design" };
+        if icons::button(ui, Icon::BurnPreview, TOP, self.prefs.burn_preview && pictures, pictures, tip).clicked() {
+            self.prefs.burn_preview = !self.prefs.burn_preview;
+        }
     }
 
     /// The left strip's icon groups (separated by lines), top to bottom.
@@ -87,7 +113,7 @@ impl BurnCraftApp {
             vec![Cmd(Icon::Offset, Command::Offset), Cmd(Icon::Weld, Command::Boolean(BooleanOp::Union)), Cmd(Icon::Subtract, Command::Boolean(BooleanOp::Subtract)), Cmd(Icon::Intersect, Command::Boolean(BooleanOp::Intersect))],
             vec![Cmd(Icon::GridArray, Command::GridArray), Cmd(Icon::CircularArray, Command::CircularArray)],
             vec![Cmd(Icon::Trace, Command::TraceImage), Cmd(Icon::Barcode, Command::Barcode)],
-            vec![ToolButton(Tool::Trim), ToolButton(Tool::Knife), ToolButton(Tool::ShapeBuilder), ToolButton(Tool::Dimension), ToolButton(Tool::Eraser)],
+            vec![ToolButton(Tool::Trim), ToolButton(Tool::Knife), ToolButton(Tool::ShapeBuilder), ToolButton(Tool::CutStart), ToolButton(Tool::Dimension), ToolButton(Tool::Eraser)],
             vec![ToolButton(Tool::Corner)],
         ]
     }
@@ -112,6 +138,7 @@ impl BurnCraftApp {
                     (Tool::Trim, _) => "Trim: click a piece of outline to delete it back to the lines crossing it".to_string(),
                     (Tool::Knife, _) => "Knife: drag a line across shapes to split them".to_string(),
                     (Tool::ShapeBuilder, _) => "Shape Builder (B): click or drag across overlapping areas to merge them (Alt: delete)".to_string(),
+                    (Tool::CutStart, _) => "Cut start: click an outline where its cut should start (Shift: cut it the other way round)".to_string(),
                     (Tool::Dimension, _) => "Dimension: drag between two points to label a distance (never cut)".to_string(),
                     (Tool::Eraser, _) => "Image eraser: drag over a picture to rub parts of it out".to_string(),
                     (Tool::Corner, _) => "Round corner: click corners to round them one at a time with this radius (Tools > Round All Corners does a whole selection)".to_string(),

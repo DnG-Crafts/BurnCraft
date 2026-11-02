@@ -101,6 +101,8 @@ pub(crate) enum Dialog {
     CopyAlong(crate::dialogs::CopyAlongDialog),
     Sections(crate::dialogs::SectionsDialog),
     PlaceSlots(crate::dialogs::PlaceSlotsDialog),
+    Check(crate::dialogs::CheckDialog),
+    CutBox(crate::dialogs::CutBoxDialog),
     Tool(crate::tools::ToolDialog),
 }
 
@@ -120,6 +122,8 @@ pub struct BurnCraftApp {
     file: Option<PathBuf>,
     /// Bumped on every edit; compared with `saved_revision` for the unsaved-changes marker.
     pub(crate) revision: u64,
+    /// The design revision the shown cut order was worked out for.
+    cut_order_revision: Option<u64>,
     saved_revision: u64,
     pub(crate) status: String,
     pub(crate) cursor: Option<Point>,
@@ -227,6 +231,7 @@ impl BurnCraftApp {
             current_layer: 0,
             file: None,
             revision: 0,
+            cut_order_revision: None,
             saved_revision: 0,
             status: "Ready".into(),
             cursor: None,
@@ -357,9 +362,10 @@ impl BurnCraftApp {
             return;
         }
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("BurnCraft or LightBurn project", &[PROJECT_EXTENSION, "lbrn2", "lbrn"])
+            .add_filter("Projects", &[PROJECT_EXTENSION, "lbrn2", "lbrn", "rld"])
             .add_filter("BurnCraft project", &[PROJECT_EXTENSION])
             .add_filter("LightBurn project", &bc_io::lightburn::EXTENSIONS)
+            .add_filter("RDWorks project", &bc_io::rld::EXTENSIONS)
             .pick_file()
         else {
             return;
@@ -382,8 +388,8 @@ impl BurnCraftApp {
     fn open_path(&mut self, path: PathBuf) {
         crate::recovery::remember(&mut self.prefs.recent, &path);
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        if bc_io::lightburn::EXTENSIONS.contains(&ext.as_str()) {
-            return self.open_lightburn(&path);
+        if bc_io::lightburn::EXTENSIONS.contains(&ext.as_str()) || bc_io::rld::EXTENSIONS.contains(&ext.as_str()) {
+            return self.open_other_project(&path);
         }
         match Document::load(&path) {
             Ok(doc) => {
@@ -394,9 +400,16 @@ impl BurnCraftApp {
         }
     }
 
-    /// Opens a LightBurn project as a new, unsaved BurnCraft document with its layer settings.
-    fn open_lightburn(&mut self, path: &Path) {
-        let project = match std::fs::read(path).map_err(|e| e.to_string()).and_then(|b| bc_io::lightburn::import(&b, self.doc.bed_size.1, &self.fonts)) {
+    /// Reads another program's project (LightBurn or RDWorks), chosen by the file's extension.
+    fn read_other_project(&self, ext: &str, bytes: &[u8]) -> Result<bc_io::lightburn::LbProject, String> {
+        if bc_io::rld::EXTENSIONS.contains(&ext) { bc_io::rld::import(bytes) } else { bc_io::lightburn::import(bytes, self.doc.bed_size.1, &self.fonts) }
+    }
+
+    /// Opens a LightBurn or RDWorks project as a new, unsaved BurnCraft document with its layer
+    /// settings.
+    fn open_other_project(&mut self, path: &Path) {
+        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let project = match std::fs::read(path).map_err(|e| e.to_string()).and_then(|b| self.read_other_project(&ext, &b)) {
             Ok(p) => p,
             Err(e) => return self.error(format!("Could not open {}: {e}", path.display())),
         };
@@ -405,7 +418,8 @@ impl BurnCraftApp {
         self.doc.bed_size = bed;
         let mut warnings = project.warnings.clone();
         let ids = self.add_lightburn(project, true);
-        // LightBurn measures from the bottom of its own bed; if that was taller than ours, slide the design on.
+        // Positions are measured from the bottom of the other program's work area; if that was taller
+        // than ours, slide the design on.
         if let Some(b) = self.doc.bounds_of(ids.iter().copied()) {
             let (w, h) = bed;
             let shift = |lo: f64, hi: f64, max: f64| if hi - lo > max { 0.0 } else if lo < 0.0 { -lo } else if hi > max { max - hi } else { 0.0 };
@@ -487,6 +501,7 @@ impl BurnCraftApp {
         all.extend(bc_io::VECTOR_EXTENSIONS);
         all.extend(bc_io::TOOLPATH_EXTENSIONS);
         all.extend(bc_io::lightburn::EXTENSIONS);
+        all.extend(bc_io::rld::EXTENSIONS);
         all.extend(bc_io::IMAGE_EXTENSIONS);
         let Some(paths) = rfd::FileDialog::new()
             .add_filter("All supported", &all)
@@ -494,6 +509,7 @@ impl BurnCraftApp {
             .add_filter("Vector (SVG, DXF, PDF, AI, EPS, EMF, WMF)", &bc_io::VECTOR_EXTENSIONS)
             .add_filter("G-code, HPGL, Ruida job", &bc_io::TOOLPATH_EXTENSIONS)
             .add_filter("LightBurn project", &bc_io::lightburn::EXTENSIONS)
+            .add_filter("RDWorks project", &bc_io::rld::EXTENSIONS)
             .add_filter("Images", &bc_io::IMAGE_EXTENSIONS)
             .pick_files()
         else {
@@ -533,8 +549,8 @@ impl BurnCraftApp {
             self.selection = ids;
             return Ok(());
         }
-        if bc_io::lightburn::EXTENSIONS.contains(&ext.as_str()) {
-            let project = bc_io::lightburn::import(&bytes, self.doc.bed_size.1, &self.fonts)?;
+        if bc_io::lightburn::EXTENSIONS.contains(&ext.as_str()) || bc_io::rld::EXTENSIONS.contains(&ext.as_str()) {
+            let project = self.read_other_project(&ext, &bytes)?;
             if project.shapes.is_empty() {
                 return Err("no shapes found".into());
             }
@@ -1362,13 +1378,14 @@ impl BurnCraftApp {
             }).response);
             bar.push(ui.menu_button("Tools", |ui| {
                 self.command_item(ui, Offset);
+                self.command_item(ui, CutBox);
                 ui.menu_button("Boolean", |ui| {
                     for op in [BooleanOp::Union, BooleanOp::Subtract, BooleanOp::Intersect] {
                         self.command_item(ui, Boolean(op));
                     }
                 });
                 ui.separator();
-                for c in [BreakApart, AutoJoin, ClosePaths, ReversePath, RoundCorners, TextOnPath, CopyAlongPath, Warp, Simplify, Blend, ClipToShape] {
+                for c in [BreakApart, AutoJoin, ClosePaths, ReversePath, ReverseCutDirection, ResetCutStart, RoundCorners, TextOnPath, CopyAlongPath, Warp, Simplify, Blend, ClipToShape] {
                     self.command_item(ui, c);
                 }
                 ui.separator();
@@ -1389,7 +1406,7 @@ impl BurnCraftApp {
                 }
             }).response);
             bar.push(ui.menu_button("Laser", |ui| {
-                for c in [Preview, Frame, Start, RunInSections, ProductionQueue, GoToOrigin, RotarySetup, MachineSettings] {
+                for c in [CheckDesign, Preview, Frame, Start, RunInSections, ProductionQueue, GoToOrigin, RotarySetup, MachineSettings] {
                     self.command_item(ui, c);
                 }
             }).response);
@@ -1400,8 +1417,12 @@ impl BurnCraftApp {
                 ui.checkbox(&mut self.prefs.show_rulers, "Rulers");
                 ui.checkbox(&mut self.prefs.snap_to_objects, "Snap to Objects");
                 ui.checkbox(&mut self.prefs.snap_to_grid, "Snap to Grid");
-                ui.checkbox(&mut self.prefs.burn_preview, "Burn Preview").on_hover_text("Show images dithered at their layer's line interval, as the laser will burn them");
+                let pictures = self.doc.shapes.iter().any(|s| matches!(s.kind, ShapeKind::Image { .. }));
+                ui.add_enabled(pictures, egui::Checkbox::new(&mut self.prefs.burn_preview, "Burn Preview (pictures)"))
+                    .on_disabled_hover_text("Shows pictures dithered as the laser will burn them. There are no pictures in this design.")
+                    .on_hover_text("Show images dithered at their layer's line interval, as the laser will burn them");
                 ui.checkbox(&mut self.prefs.smart_guides, "Smart Guides").on_hover_text("While moving, line shapes up with other shapes, the bed and guides");
+                ui.checkbox(&mut self.canvas.show_cut_order, "Show Cut Order").on_hover_text("Number each cut in the order it runs, with an arrow the way it goes and dashed lines for the moves between (cutting layers)");
                 ui.checkbox(&mut self.canvas.show_constraints, "Show Constraints").on_hover_text("Draw locked sizes and distances (Arrange > Parameters & Constraints) as blue dimensions");
                 ui.menu_button("Symmetry", |ui| {
                     use crate::canvas::SymmetryMode;
@@ -1723,6 +1744,25 @@ impl BurnCraftApp {
                     keep = false;
                 }
             }
+            Dialog::Check(d) => match d.ui(ctx, &self.doc, self.revision) {
+                Some(crate::dialogs::CheckAction::Select(ids)) => {
+                    self.selection = ids;
+                    self.status = format!("Selected {} shape(s)", self.selection.len());
+                }
+                Some(crate::dialogs::CheckAction::Fix(problem, ids)) => self.fix_problem(problem, &ids),
+                Some(crate::dialogs::CheckAction::Close) => keep = false,
+                None => {}
+            },
+            Dialog::CutBox(d) => {
+                let layers: Vec<(usize, String)> = self.doc.palette_layers().into_iter().map(|i| (i, self.doc.layers[i].name.clone())).collect();
+                if let Some(o) = d.ui(ctx, &layers, !self.selection.is_empty()) {
+                    if matches!(o, Outcome::Ok) {
+                        let (margin, radius, layer) = (d.margin, d.radius, d.layer);
+                        self.add_cut_box(margin, radius, layer);
+                    }
+                    keep = false;
+                }
+            }
             Dialog::Offset(d) => {
                 if let Some(o) = d.ui(ctx) {
                     if matches!(o, Outcome::Ok) {
@@ -1909,14 +1949,83 @@ impl BurnCraftApp {
         let built = bc_geom::curveops::Builder::new(&paths);
         self.canvas.builder_regions = built.as_ref().map(|b| b.outlines().to_vec()).unwrap_or_default();
         if built.is_none() {
-            self.status = "Shape Builder: select two or more overlapping closed shapes".into();
+            self.status = "Shape Builder: needs two or more overlapping closed shapes".into();
         }
         self.builder = Some((self.revision, self.selection.clone(), built));
     }
 
-    /// The selected shapes the Shape Builder works on (not pictures), in document order.
+    /// Keeps the cut order shown on the design up to date (only while it's shown).
+    fn refresh_cut_order(&mut self) {
+        if !self.canvas.show_cut_order && self.canvas.tool != crate::canvas::Tool::CutStart {
+            self.cut_order_revision = None;
+            self.canvas.cut_order.clear();
+            return;
+        }
+        if self.cut_order_revision != Some(self.revision) {
+            self.canvas.cut_order = bc_job::cut_order(&self.doc);
+            self.cut_order_revision = Some(self.revision);
+        }
+    }
+
+    /// Check Design's fixes: close open shapes, or delete copies and tiny shapes.
+    fn fix_problem(&mut self, problem: bc_doc::check::Problem, ids: &BTreeSet<u64>) {
+        use bc_doc::check::Problem;
+        match problem {
+            Problem::OpenOnFill | Problem::OpenOnLine => {
+                self.checkpoint_named("Close open shapes");
+                let n = edit::close_paths(&mut self.doc, ids, f64::INFINITY);
+                self.status = format!("Closed {n} shape(s)");
+            }
+            Problem::Duplicate | Problem::Tiny => {
+                self.checkpoint_named(if problem == Problem::Duplicate { "Delete duplicates" } else { "Delete tiny shapes" });
+                let n = self.doc.remove_where(|id| ids.contains(&id));
+                self.prune_selection();
+                self.status = format!("Deleted {n} shape(s)");
+            }
+            Problem::Overlap | Problem::Outside => return,
+        }
+        self.revision += 1;
+    }
+
+    /// Cut Box: a rectangle around the selection (or the whole design) on `layer`, or on a new
+    /// layer after all the others so it's cut last.
+    fn add_cut_box(&mut self, margin: f64, radius: f64, layer: Option<usize>) {
+        let layer = layer.or_else(|| {
+            let last = self.doc.shapes.iter().map(|s| s.layer).filter(|l| !bc_doc::is_tool_layer(*l)).max();
+            last.map(|l| l + 1).filter(|l| !bc_doc::is_tool_layer(*l) && !self.doc.layers[*l].added).or_else(|| self.doc.spare_layer())
+        });
+        let Some(layer) = layer else {
+            self.status = "All layers are in use: choose one of them for the cut box".into();
+            return;
+        };
+        self.checkpoint_named("Cut box");
+        let new_layer = !self.doc.layers[layer].added && !self.doc.shapes.iter().any(|s| s.layer == layer);
+        if new_layer {
+            let l = &mut self.doc.layers[layer];
+            l.added = true;
+            l.mode = bc_doc::LayerMode::Line;
+        }
+        match edit::cut_box(&mut self.doc, &self.selection, margin, radius, layer) {
+            Some(id) => {
+                self.selection = BTreeSet::from([id]);
+                self.current_layer = layer;
+                self.status = format!("Added a cut box on layer {}", bc_doc::layer_label(layer));
+            }
+            None => self.status = "Nothing to put a cut box around".into(),
+        }
+        self.revision += 1;
+    }
+
+    /// The shapes the Shape Builder works on, in document order: the selected ones, or with fewer
+    /// than two selected, every shape that can be seen (not pictures, hidden layers or the tool
+    /// layers).
     fn builder_ids(&self) -> Vec<u64> {
-        self.doc.shapes.iter().filter(|s| self.selection.contains(&s.id) && !matches!(s.kind, ShapeKind::Image { .. })).map(|s| s.id).collect()
+        let usable = |s: &&Shape| !matches!(s.kind, ShapeKind::Image { .. }) && !bc_doc::is_tool_layer(s.layer) && self.doc.layers.get(s.layer).is_some_and(|l| l.visible);
+        let selected: Vec<u64> = self.doc.shapes.iter().filter(|s| self.selection.contains(&s.id)).filter(usable).map(|s| s.id).collect();
+        if selected.len() >= 2 {
+            return selected;
+        }
+        self.doc.shapes.iter().filter(usable).map(|s| s.id).collect()
     }
 
     /// Shape Builder: merges the areas under `points` into one shape (or with `delete`, removes
@@ -2015,9 +2124,10 @@ impl BurnCraftApp {
     }
 
     fn preview_window(&mut self, ctx: &egui::Context) {
+        let speed = self.laser.speed(self.prefs.units);
         let Some(preview) = &mut self.preview else { return };
         let bed = self.doc.bed_size;
-        match preview.ui(ctx, bed, self.laser.device.connected) {
+        match preview.ui(ctx, bed, self.laser.device.connected, speed) {
             Some(PreviewAction::Close) => self.preview = None,
             Some(PreviewAction::Frame) => {
                 let r = self.laser.frame(&preview.job, bed);
@@ -2036,6 +2146,12 @@ impl BurnCraftApp {
     }
 
     fn apply_canvas_actions(&mut self, actions: Vec<CanvasAction>) {
+        // Edits on the canvas (a drag, say) change the design after their undo checkpoint, so the
+        // revision must move again for what follows it (cut order, Check Design) to see the change.
+        let edits = actions.iter().any(|a| !matches!(a, CanvasAction::SetSelection(_) | CanvasAction::TextAt(_) | CanvasAction::EditText(_) | CanvasAction::Status(_) | CanvasAction::MoveLaser(_) | CanvasAction::Checkpoint(_)));
+        if edits {
+            self.revision += 1;
+        }
         for action in actions {
             match action {
                 CanvasAction::Checkpoint(label) => self.checkpoint_named(label),
@@ -2065,13 +2181,31 @@ impl BurnCraftApp {
                 CanvasAction::Status(text) => self.status = text,
                 CanvasAction::MoveLaser(p) => {
                     if self.laser.device.connected {
-                        self.laser.move_to_design(self.doc.bed_size, p);
+                        if !self.laser.move_to_design(self.doc.bed_size, p) {
+                            self.status = "That's outside the work area: the head went to the nearest edge instead".into();
+                        }
                     } else {
                         self.status = "Connect to the laser to position the head".into();
                     }
                 }
                 CanvasAction::SetGuides(guides) => self.doc.guides = guides,
                 CanvasAction::Dimension(a, b) => self.add_dimension(a, b),
+                CanvasAction::CutStart(p, tolerance, reverse) => match edit::outline_near(&self.doc, p, tolerance) {
+                    Some(id) => {
+                        self.checkpoint_named(if reverse { "Reverse cut direction" } else { "Set cut start" });
+                        let s = self.doc.shape_mut(id).expect("found above");
+                        let local = s.transform.inverse() * p;
+                        let cut = s.cut.get_or_insert_default();
+                        if reverse {
+                            cut.reverse = !cut.reverse;
+                        } else {
+                            cut.point = Some(local);
+                        }
+                        self.revision += 1;
+                        self.status = if reverse { "Cut direction reversed".into() } else { "Cut start set".into() };
+                    }
+                    None => self.status = "Click on a shape's outline".into(),
+                },
                 CanvasAction::Trim(p, tolerance) => {
                     let mut changed = self.doc.clone();
                     match edit::trim_at(&mut changed, p, tolerance) {
@@ -2184,6 +2318,7 @@ impl eframe::App for BurnCraftApp {
         self.canvas.machine_origin = Some(self.laser.machine(self.doc.bed_size).to_design((0.0, 0.0)));
         // While Trace Image is open, its result shows on the design as it'll be made.
         self.refresh_builder();
+        self.refresh_cut_order();
         self.canvas.highlight = match &self.dialog {
             Some(Dialog::Trace(d)) => d.result.clone(),
             _ => None,

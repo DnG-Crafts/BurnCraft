@@ -16,7 +16,8 @@ mod mem {
     pub const BED_SIZE_Y: [u8; 2] = [0x00, 0x36];
 }
 
-/// Direction keys for continuous jogging.
+/// Direction keys for continuous jogging, as on the controller's keypad: the axis moves from the
+/// key press until its release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JogKey {
     XLeft,
@@ -25,6 +26,8 @@ pub enum JogKey {
     YBottom,
     ZUp,
     ZDown,
+    UForward,
+    UBackward,
 }
 
 impl JogKey {
@@ -36,6 +39,8 @@ impl JogKey {
             JogKey::YBottom => 0x23,
             JogKey::ZUp => 0x24,
             JogKey::ZDown => 0x25,
+            JogKey::UForward => 0x26,
+            JogKey::UBackward => 0x27,
         }
     }
 }
@@ -236,6 +241,18 @@ mod tests {
         expected.extend_from_slice(&encode_coord(10_000));
         expected.extend_from_slice(&encode_coord(2_500));
         assert_eq!(got[0], expected);
+    }
+
+    #[test]
+    fn keypad_keys_press_and_release() {
+        let fake = FakeController::start(false);
+        let c = Controller::from_link(fake.link());
+        for (key, down) in [(JogKey::ZUp, 0x24), (JogKey::ZDown, 0x25), (JogKey::UForward, 0x26), (JogKey::UBackward, 0x27)] {
+            c.jog_key(key, true).unwrap();
+            c.jog_key(key, false).unwrap();
+            let got = fake.received.lock().unwrap();
+            assert_eq!(got[got.len() - 2..], [vec![0xD8, down], vec![0xD8, down + 0x10]], "{key:?}");
+        }
     }
 
     #[test]

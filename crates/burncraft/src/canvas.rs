@@ -67,6 +67,8 @@ pub enum Tool {
     Eraser,
     /// Click or drag across the areas where selected shapes overlap to merge them (Alt: delete).
     ShapeBuilder,
+    /// Sets where a shape's cut starts and which way it runs.
+    CutStart,
 }
 
 impl Tool {
@@ -91,6 +93,7 @@ impl Tool {
             Tool::Eraser => Icon::Eraser,
             Tool::Dimension => Icon::Dimension,
             Tool::ShapeBuilder => Icon::ShapeBuilder,
+            Tool::CutStart => Icon::CutStart,
         }
     }
 
@@ -112,6 +115,7 @@ impl Tool {
             Tool::Eraser => "Image eraser",
             Tool::Dimension => "Dimension",
             Tool::ShapeBuilder => "Shape Builder",
+            Tool::CutStart => "Cut start",
         }
     }
 
@@ -126,7 +130,7 @@ impl Tool {
             Tool::Polygon => Some(Key::P),
             Tool::Star => Some(Key::S),
             Tool::Text => Some(Key::T),
-            Tool::PositionLaser | Tool::Corner | Tool::Trim | Tool::Knife | Tool::Dimension | Tool::Eraser => None,
+            Tool::PositionLaser | Tool::Corner | Tool::Trim | Tool::Knife | Tool::Dimension | Tool::Eraser | Tool::CutStart => None,
             Tool::ShapeBuilder => Some(Key::B),
             Tool::Measure => Some(Key::M),
         }
@@ -159,13 +163,19 @@ impl Tool {
             Tool::Polygon | Tool::Star => &["Drag out from the centre to draw.", "Set the number of sides or points under the tools."],
             Tool::Text => &["Click where the text should go.", "Double-click existing text to edit it."],
             Tool::PositionLaser => &["Click to move the laser head there, with the laser off."],
+            Tool::CutStart => &[
+                "The cut order is shown: each cut's number, where it starts and which way it runs.",
+                "Click a shape's outline where its cut should start.",
+                "Shift+click a shape to cut it the other way round.",
+                "Tools > Reset Cut Start puts the selected shapes back to automatic.",
+            ],
             Tool::Measure => &["Drag between two points to see the distance and angle. Nothing is added to the design."],
             Tool::Trim => &["Click a piece of outline to delete it back to the nearest lines crossing it.", "Press Esc when you're done."],
             Tool::Knife => &["Drag a line right across shapes to split each of them in two.", "Press Esc when you're done."],
             Tool::Eraser => &["Brush: drag over a picture to rub parts of it out; they won't burn. Set the brush size under the tools.", "Colour: click an area of a picture (a white background, say) to clear it, and everything touching it of that colour. Tick All to clear that colour all over the picture.", "Press Esc when you're done."],
             Tool::Dimension => &["Drag between two points to add a labelled dimension.", "Dimensions are shown but never cut."],
             Tool::ShapeBuilder => &[
-                "Select overlapping shapes first: every area their outlines enclose is outlined.",
+                "Every area the shapes' outlines enclose is outlined. With two or more shapes selected, only those are used.",
                 "Click an area, or drag across several, to merge them into one shape.",
                 "Hold Alt and click or drag to delete areas instead.",
                 "Press Esc when you're done.",
@@ -333,6 +343,10 @@ pub struct Canvas {
     pub symmetry: Symmetry,
     /// Draw locked sizes and distances.
     pub show_constraints: bool,
+    /// View > Show Cut Order: draw each cut's number, start and direction, and the moves between.
+    pub show_cut_order: bool,
+    /// The cuts in order (design mm), kept up to date by the app while shown.
+    pub cut_order: Vec<Vec<Point>>,
 }
 
 impl Default for Canvas {
@@ -376,6 +390,8 @@ impl Default for Canvas {
             eraser_everywhere: false,
             symmetry: Symmetry::default(),
             show_constraints: true,
+            show_cut_order: false,
+            cut_order: Vec::new(),
         }
     }
 }
@@ -403,6 +419,9 @@ pub enum CanvasAction {
     SetGuides(Vec<bc_doc::GuideLine>),
     /// Trim tool clicked here (with this pick tolerance, mm).
     Trim(Point, f64),
+    /// Cut Start tool: start the cut of the outline near a point there (within a tolerance in mm),
+    /// or with `true`, reverse which way it runs.
+    CutStart(Point, f64, bool),
     /// Knife dragged from the first point to the second.
     Knife(Point, Point),
     /// Dimension dragged from the first point to the second.
@@ -712,6 +731,14 @@ impl Canvas {
                     actions.push(CanvasAction::Trim(p, 6.0 / self.view.zoom as f64));
                 }
             }
+            Tool::CutStart => {
+                if response.clicked_by(egui::PointerButton::Primary)
+                    && let Some(p) = pointer
+                {
+                    let reverse = ui.input(|i| i.modifiers.shift);
+                    actions.push(CanvasAction::CutStart(p, 6.0 / self.view.zoom as f64, reverse));
+                }
+            }
             Tool::Dimension => {
                 let primary = egui::PointerButton::Primary;
                 if response.drag_started_by(primary)
@@ -933,6 +960,9 @@ impl Canvas {
         }
         if self.show_constraints {
             self.draw_constraints(&painter, origin, doc);
+        }
+        if self.show_cut_order || self.tool == Tool::CutStart {
+            self.draw_cut_order(&painter, origin);
         }
         if self.tool == Tool::Eraser {
             let radius = (self.eraser_mm / 2.0) as f32 * self.view.zoom;
@@ -1245,7 +1275,7 @@ impl Canvas {
             Tool::Text => Some(C::Text),
             Tool::Rect | Tool::Ellipse | Tool::Polygon | Tool::Star | Tool::Line | Tool::Measure | Tool::PositionLaser => Some(C::Crosshair),
             Tool::Corner => Some(if self.corner_at(doc, doc_point).is_some() { C::PointingHand } else { C::Crosshair }),
-            Tool::Trim => Some(if bc_doc::edit::outline_near(doc, doc_point, 6.0 / self.view.zoom as f64).is_some() { C::PointingHand } else { C::Crosshair }),
+            Tool::Trim | Tool::CutStart => Some(if bc_doc::edit::outline_near(doc, doc_point, 6.0 / self.view.zoom as f64).is_some() { C::PointingHand } else { C::Crosshair }),
             Tool::Knife | Tool::Dimension => Some(C::Crosshair),
             Tool::Eraser | Tool::ShapeBuilder => Some(C::Crosshair),
         }
@@ -1711,6 +1741,41 @@ impl Canvas {
 
     /// The Shape Builder's areas: each outlined, and those under the pointer (or its drag) drawn
     /// thick, green to merge or red to delete.
+    /// Cut order: a dashed line for each move between cuts, then at each cut's start an arrow the
+    /// way it runs and its number.
+    fn draw_cut_order(&self, painter: &egui::Painter, origin: Pos2) {
+        /// Beyond this many cuts, numbers would only be clutter: just the moves and arrows.
+        const MAX_LABELS: usize = 2000;
+        let accent = Color32::from_rgb(230, 120, 30);
+        let travel = Stroke::new(1.0, Color32::from_rgba_unmultiplied(90, 140, 230, 170));
+        let mut at = Point::ORIGIN;
+        for path in &self.cut_order {
+            let (from, to) = (self.view.to_screen(origin, at), self.view.to_screen(origin, path[0]));
+            if from.distance(to) > 2.0 {
+                painter.extend(egui::Shape::dashed_line(&[from, to], travel, 4.0, 3.0));
+            }
+            at = *path.last().expect("cuts have points");
+        }
+        for (i, path) in self.cut_order.iter().enumerate() {
+            let start = self.view.to_screen(origin, path[0]);
+            // Direction: towards the first point that's visibly away from the start.
+            if let Some(next) = path.iter().map(|p| self.view.to_screen(origin, *p)).find(|p| p.distance(start) > 3.0) {
+                let dir = (next - start).normalized();
+                let tip = start + dir * 12.0;
+                let side = egui::vec2(-dir.y, dir.x) * 4.0;
+                painter.line_segment([start, tip], Stroke::new(2.0, accent));
+                painter.add(egui::Shape::convex_polygon(vec![tip + dir * 4.0, tip - side, tip + side], accent, Stroke::NONE));
+            }
+            painter.circle_filled(start, 3.0, accent);
+            if i < MAX_LABELS {
+                let galley = painter.layout_no_wrap((i + 1).to_string(), egui::FontId::proportional(11.0), Color32::WHITE);
+                let pos = start + egui::vec2(-galley.size().x - 6.0, -galley.size().y - 4.0);
+                painter.rect_filled(egui::Rect::from_min_size(pos, galley.size()).expand(2.0), 3.0, accent);
+                painter.galley(pos, galley, Color32::WHITE);
+            }
+        }
+    }
+
     fn draw_builder(&self, painter: &egui::Painter, origin: Pos2, delete: bool, pointer: Option<Point>) {
         let mut picked: Vec<usize> = Vec::new();
         let points: Vec<Point> = match &self.gesture {
@@ -1893,7 +1958,7 @@ impl Canvas {
             }
             (Some(Gesture::Create { start }), Some(h)) => {
                 if let Some((kind, t)) = self.make_shape(*start, self.snap(h), shift) {
-                    let shape = Shape { id: 0, kind, transform: t, layer: 0, locked: false, group: None, effects: Vec::new() };
+                    let shape = Shape { id: 0, kind, transform: t, layer: 0, locked: false, group: None, effects: Vec::new(), cut: None };
                     let path = shape.world_path();
                     let ghost = Stroke::new(1.0, color.gamma_multiply(0.45));
                     for (copy, stroke) in std::iter::once((Affine::IDENTITY, stroke)).chain(self.symmetry.copies().into_iter().map(|c| (c, ghost))) {

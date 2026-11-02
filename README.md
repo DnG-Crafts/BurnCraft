@@ -19,7 +19,7 @@
 
 BurnCraft is a desktop app for laser cutters and engravers. It covers the whole workflow in one window: draw or import a design, assign cut, fill and image settings by layer, preview the toolpath with a time estimate, then frame and run the job on the machine.
 
-It drives **Ruida** DSP controllers (most CO2 lasers), **G-code** machines (GRBL, Marlin, Smoothieware, plus diode lasers like the LaserPecker LP2 Plus) and **galvo** fiber/UV/CO2 markers. It also opens **LightBurn** project files and device profiles, so you can bring your existing work with you.
+It drives **Ruida** DSP controllers (most CO2 lasers), **G-code** machines (GRBL, Marlin, Smoothieware, plus diode lasers like the LaserPecker LP2 Plus) and **galvo** fiber/UV/CO2 markers. It also opens **LightBurn** project files and device profiles, and **RDWorks** projects, so you can bring your existing work with you.
 
 > [!WARNING]
 > BurnCraft is in early development. Ruida over Ethernet has been run on real hardware (RDC6445G). The other drivers are tested against simulated controllers only. Lasers are dangerous: always supervise a running job, keep the lid closed, and keep a fire extinguisher nearby. See [Safety](#safety).
@@ -54,7 +54,9 @@ It drives **Ruida** DSP controllers (most CO2 lasers), **G-code** machines (GRBL
 - **Several controller families:** Ruida (Ethernet/USB), GRBL / Marlin / Smoothieware / custom G-code (USB serial), BJJCZ galvo boards (USB) and the LaserPecker 2 (USB).
 - **Machine profiles:** keep a list of lasers, switch between them, import LightBurn `.lbdev` device files and `.lbzip` exports (for example the ones LaserPecker publishes), and export your machines to BurnCraft `.bcdev` files to move them to another computer.
 - **Opens LightBurn files:** `.lbrn2` / `.lbrn` projects open with their layers, shapes, groups, images and editable text.
-- **Accurate preview:** see every burn, overscan and travel move with a scrubber and a time estimate before you fire the laser.
+- **Opens RDWorks files:** `.rld` projects saved by RDWorks V8 open with their layers (colour, mode, speed, power, output), lines and curves, text, pictures and groups.
+- **Accurate preview:** see every burn, overscan and travel move with a scrubber and a time estimate before you fire the laser, or play the job as a simulation.
+- **Check Design:** finds open shapes, duplicates, shared edges, tiny leftovers and shapes off the bed before a job, with one-click fixes.
 - **Variable text:** serial numbers, dates and CSV merge for batches of tags, labels and name plates.
 - **Camera overlay:** line up designs on the material using a webcam over the bed.
 - **Box generator:** finger-jointed boxes and living hinges, sized by inside or outside dimensions, with kerf compensation.
@@ -167,13 +169,15 @@ If you run BurnCraft on any of the untested controllers, a report of how it went
   - **Fill + Line:** engrave the inside, then cut the outline.
   - **Image:** raster-engrave photos with Threshold, Ordered, Floyd–Steinberg, Atkinson, Jarvis or Stucki dithering, or Grayscale (power follows darkness on G-code machines).
 - **Per-layer settings:** speed, min/max power, passes, line interval, scan both ways, overscan, air assist, output on/off, visibility, pulse frequency for galvos, and perforation (dashed cutting: cut length and gap).
-- **Advanced settings:** kerf compensation, tabs/bridges (count, width, skip holes) and lead-ins that start in the scrap.
+- **Advanced settings:** kerf compensation, tabs/bridges (count, width, skip holes), lead-ins that start in the scrap, overcut so parts drop out cleanly, and laser on/off delays to pierce thick material (G-code machines).
+- **Cut Box:** one click adds a rectangle (with a margin and optional rounded corners) around the design on its own last layer, to cut the piece free.
 - **Cut library:** save layer settings by name and apply them to any layer.
 - **Test patterns:** a speed × power grid, line-interval squares, a focus ramp (find the focus height on a tilted board) and a kerf strip (cut, push together, measure).
 
 ### Preview and running jobs
 
-- **Preview** (Alt+P): every burn, overscan and travel move drawn on the bed, with a progress scrubber and an estimated job time.
+- **Preview** (Alt+P): every burn, overscan and travel move drawn on the bed, with a progress scrubber and an estimated job time. **Play** simulates the job at 1× to 100× speed, showing the head, elapsed time and what it's doing.
+- **Show Cut Order** (View menu): each cut numbered on the design in the order it runs, with its start point, an arrow for its direction and the moves between cuts. The **Cut start** tool sets where a shape's cut starts (click its outline) and which way it runs (Shift+click).
 - **Realistic preview:** the job burned into birch plywood, walnut, slate, black anodised or acrylic, clear acrylic, leather or cardboard. Darkness follows each layer's power, speed and passes.
 - **Frame** the job's outline with the laser off. On machines that support it, you can also frame with the laser on at very low power. Galvos frame with the red pointer.
 - **Start, Pause, Resume, Stop**, with a progress bar while the job is sent or run.
@@ -215,6 +219,7 @@ If you run BurnCraft on any of the untested controllers, a report of how it went
 | BurnCraft project (`.bcproj`, JSON with embedded images) | ✅ | ✅ |
 | LightBurn project (`.lbrn2`, `.lbrn`) | ✅ Layers, shapes, groups, paths, images, editable text | - |
 | LightBurn device (`.lbdev`) | ✅ As machine profiles | - |
+| RDWorks project (`.rld`, RDWorks V8) | ✅ Layers (colour, speed, power, output, scan interval), lines and curves, text outlines, pictures, groups | - |
 | SVG | ✅ Colours map to layers; text becomes outlines | ✅ |
 | DXF | ✅ Lines, polylines with arcs, circles, arcs, ellipses, splines; units honoured | ✅ Polylines in mm, one DXF layer per BurnCraft layer, in its colour |
 | PDF | ✅ Vector paths from the first page (colours pick layers); text and images are reported, not imported | - |
@@ -336,9 +341,10 @@ The LP2 doesn't speak G-code, so it has its own controller type instead of a dev
 
 1. Close the LaserPecker app so the USB port is free. On Windows the LP2 needs the CH340 driver.
 2. In **Devices**, use **Find My Laser** (it recognises the LP2), or **Create Manually** and choose **LaserPecker 2** and its serial port.
-3. Layer speeds are shown as **depth** (1-100 %), like the LaserPecker app: deeper is slower. Power is the layer's max power.
-4. **Frame** traces the job's outline with the LP2's preview light for 15 seconds (or until **Stop**).
-5. Line layers are sent as G-code; Fill and Image layers are sent as a bitmap at 0.1 mm per pixel. A job with several layers runs them one after another.
+3. Under the machine's details in **Devices** are the LP2's own settings (work mode, beep, touch buttons, engraving direction, free mode and so on). They're sent each time it connects.
+4. Layer speeds are shown as **depth** (1-100 %), like the LaserPecker app: deeper is slower. Power is the layer's max power.
+5. **Frame** traces the job's outline with the LP2's preview light for 15 seconds (or until **Stop**).
+6. Line layers are sent as G-code; Fill and Image layers are sent as a bitmap at the LP2's 1K, 1.3K or 2K resolution: Image layers choose it from a Resolution drop-down, and Fill layers use the one nearest their line interval. The machine runs the passes itself. A job with several layers runs them one after another.
 
 The LP2 can't pause from BurnCraft, and has no head to jog or home. **Stop** sends the same command the LaserPecker app uses to end a preview; if a job keeps going, press the button on the machine.
 
@@ -385,7 +391,7 @@ BurnCraft is a Cargo workspace. Everything except the app itself is a standalone
 | [`bc-geom`](crates/bc-geom) | Geometry on top of `kurbo`: outlines, flattening, hit testing, booleans and offsets (via `geo`), node editing, fillets |
 | [`bc-doc`](crates/bc-doc) | Document model: shapes, layers, groups, undo history, project files, editing operations, nesting, variable text |
 | [`bc-raster`](crates/bc-raster) | Image decoding, adjustments, resampling, dithering, tracing |
-| [`bc-io`](crates/bc-io) | LightBurn / SVG / DXF / image import, `.lbdev` device files, SVG export, fonts and text outlines, barcodes, CSV |
+| [`bc-io`](crates/bc-io) | LightBurn / RDWorks / SVG / DXF / image import, `.lbdev` device files, SVG export, fonts and text outlines, barcodes, CSV |
 | [`bc-job`](crates/bc-job) | Job builder: kerf, tabs, lead-ins, ordering, fills, overscan, image rasterising, grayscale, time estimates |
 | [`bc-ruida`](crates/bc-ruida) | Ruida driver: per-model byte scrambling, job encoding, UDP and USB links, machine control |
 | [`bc-grbl`](crates/bc-grbl) | G-code driver: generation for each dialect, response parsing, streaming, machine control |

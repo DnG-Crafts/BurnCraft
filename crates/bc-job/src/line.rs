@@ -22,7 +22,8 @@ pub(crate) fn polygon_contains(poly: &[Point], p: Point) -> bool {
 
 /// Outlines for cutting: kerf-compensated, ordered, with tabs and lead-ins.
 pub(crate) fn line_paths(shapes: &[&Shape], settings: &Layer) -> Vec<JobPath> {
-    let mut polylines: Vec<Vec<Point>> = Vec::new();
+    // Each outline, and whether its start was set by hand (so ordering keeps it).
+    let mut polylines: Vec<(Vec<Point>, bool)> = Vec::new();
     for s in shapes {
         let mut path = s.world_path();
         if settings.kerf.abs() > 1e-9 && s.is_closed() {
@@ -31,14 +32,29 @@ pub(crate) fn line_paths(shapes: &[&Shape], settings: &Layer) -> Vec<JobPath> {
                 path = p;
             }
         }
-        for mut l in bc_geom::flatten(&path, OUTPUT_TOLERANCE) {
-            if l.closed {
-                l.points.push(l.points[0]);
+        let mut lines: Vec<Vec<Point>> = bc_geom::flatten(&path, OUTPUT_TOLERANCE)
+            .into_iter()
+            .map(|mut l| {
+                if l.closed {
+                    l.points.push(l.points[0]);
+                }
+                l.points
+            })
+            .collect();
+        let mut fixed = vec![false; lines.len()];
+        if let Some(cut) = s.cut {
+            if cut.reverse {
+                lines.iter_mut().for_each(|l| l.reverse());
             }
-            polylines.push(l.points);
+            if let Some(local) = cut.point
+                && let Some(i) = start_at(&mut lines, s.transform * local)
+            {
+                fixed[i] = true;
+            }
         }
+        polylines.extend(lines.into_iter().zip(fixed));
     }
-    let material: Vec<Vec<Point>> = polylines.iter().filter(|p| is_closed(p)).cloned().collect();
+    let material: Vec<Vec<Point>> = polylines.iter().map(|(p, _)| p).filter(|p| is_closed(p)).cloned().collect();
     let in_material = |p: Point| material.iter().filter(|ring| polygon_contains(ring, p)).count() % 2 == 1;
 
     let mut out = Vec::new();
@@ -57,10 +73,32 @@ pub(crate) fn line_paths(shapes: &[&Shape], settings: &Layer) -> Vec<JobPath> {
             let lead = settings.lead_in > 0.0 && path.len() > 1 && path[0] != *path.last().unwrap();
             out.extend(split_for_tabs(&path, settings.tab_count, settings.tab_size, lead).into_iter().map(JobPath::burn));
         } else {
+            if settings.overcut > 0.0 {
+                let lead = settings.lead_in > 0.0 && path.len() > 1 && path[0] != *path.last().unwrap();
+                overcut(&mut path, settings.overcut, lead);
+            }
             out.push(JobPath::burn(path));
         }
     }
     out
+}
+
+/// Carries a closed cut on past its start for `length` mm, along the start of the outline again,
+/// so the cut closes fully. With `has_lead`, the first point is a lead-in, not part of the ring.
+fn overcut(path: &mut Vec<Point>, length: f64, has_lead: bool) {
+    let ring: Vec<Point> = path[usize::from(has_lead)..].to_vec();
+    let mut left = length;
+    for w in ring.windows(2) {
+        let d = w[0].distance(w[1]);
+        if d >= left {
+            if left > 1e-9 {
+                path.push(w[0].lerp(w[1], left / d));
+            }
+            return;
+        }
+        left -= d;
+        path.push(w[1]);
+    }
 }
 
 /// A point `length` mm from the start of a closed path, on the scrap side. The lead comes in
@@ -125,19 +163,62 @@ fn split_for_tabs(path: &[Point], count: u32, size: f64, has_lead: bool) -> Vec<
     pieces
 }
 
+/// Makes the outline nearest `p` start at its nearest point to `p`: a closed one is turned round
+/// to start there, an open one runs from whichever end is nearer. Returns which outline.
+fn start_at(lines: &mut [Vec<Point>], p: Point) -> Option<usize> {
+    let (i, seg, q, _) = lines
+        .iter()
+        .enumerate()
+        .flat_map(|(i, l)| {
+            l.windows(2).enumerate().map(move |(k, w)| {
+                let q = nearest_on_segment(w[0], w[1], p);
+                (i, k, q, q.distance(p))
+            })
+        })
+        .min_by(|a, b| a.3.total_cmp(&b.3))?;
+    let line = &mut lines[i];
+    if is_closed(line) {
+        let mut ring: Vec<Point> = line[..line.len() - 1].to_vec();
+        // Start at q: on the segment after vertex `seg`, or at a vertex if it's (nearly) one.
+        let at = if q.distance(ring[seg]) < 1e-6 {
+            seg
+        } else if q.distance(ring[(seg + 1) % ring.len()]) < 1e-6 {
+            (seg + 1) % ring.len()
+        } else {
+            ring.insert(seg + 1, q);
+            seg + 1
+        };
+        ring.rotate_left(at);
+        ring.push(ring[0]);
+        *line = ring;
+    } else if p.distance(*line.last().expect("lines have points")) < p.distance(line[0]) {
+        line.reverse();
+    }
+    Some(i)
+}
+
+fn nearest_on_segment(a: Point, b: Point, p: Point) -> Point {
+    let ab = b - a;
+    let len2 = ab.hypot2();
+    if len2 <= 0.0 {
+        return a;
+    }
+    a + ab * ((p - a).dot(ab) / len2).clamp(0.0, 1.0)
+}
+
 /// Orders paths: deepest-nested first (holes before the parts around them), and within
-/// each depth, greedily the nearest start point. Closed paths may start at any vertex.
-/// Returns each path with its nesting depth.
-pub(crate) fn order_paths(paths: Vec<Vec<Point>>) -> Vec<(Vec<Point>, usize)> {
+/// each depth, greedily the nearest start point. Closed paths may start at any vertex, unless
+/// their start was set by hand (`true`). Returns each path with its nesting depth.
+pub(crate) fn order_paths(paths: Vec<(Vec<Point>, bool)>) -> Vec<(Vec<Point>, usize)> {
     let depth: Vec<usize> = paths
         .iter()
         .enumerate()
-        .map(|(i, p)| paths.iter().enumerate().filter(|(j, q)| *j != i && is_closed(q) && polygon_contains(q, p[0])).count())
+        .map(|(i, (p, _))| paths.iter().enumerate().filter(|(j, (q, _))| *j != i && is_closed(q) && polygon_contains(q, p[0])).count())
         .collect();
     let max_depth = depth.iter().copied().max().unwrap_or(0);
     let mut out = Vec::with_capacity(paths.len());
     let mut pos = Point::ORIGIN;
-    let mut remaining: Vec<Option<Vec<Point>>> = paths.into_iter().map(Some).collect();
+    let mut remaining: Vec<Option<(Vec<Point>, bool)>> = paths.into_iter().map(Some).collect();
     for d in (0..=max_depth).rev() {
         loop {
             // Nearest remaining path at this depth, and the vertex to start from.
@@ -146,8 +227,8 @@ pub(crate) fn order_paths(paths: Vec<Vec<Point>>) -> Vec<(Vec<Point>, usize)> {
                 .enumerate()
                 .filter(|(i, p)| p.is_some() && depth[*i] == d)
                 .map(|(i, p)| {
-                    let p = p.as_ref().unwrap();
-                    let (k, dist) = if is_closed(p) {
+                    let (p, fixed) = p.as_ref().unwrap();
+                    let (k, dist) = if is_closed(p) && !fixed {
                         p[..p.len() - 1].iter().enumerate().map(|(k, v)| (k, v.distance(pos))).fold((0, f64::INFINITY), |a, b| if b.1 < a.1 { b } else { a })
                     } else {
                         (0, p[0].distance(pos))
@@ -156,7 +237,7 @@ pub(crate) fn order_paths(paths: Vec<Vec<Point>>) -> Vec<(Vec<Point>, usize)> {
                 })
                 .min_by(|a, b| a.2.total_cmp(&b.2));
             let Some((i, k, _)) = best else { break };
-            let mut path = remaining[i].take().unwrap();
+            let (mut path, _) = remaining[i].take().unwrap();
             if is_closed(&path) && k > 0 {
                 path.pop();
                 path.rotate_left(k);
@@ -222,6 +303,22 @@ mod tests {
 
     fn square(x: f64, y: f64, s: f64) -> Vec<Point> {
         vec![Point::new(x, y), Point::new(x + s, y), Point::new(x + s, y + s), Point::new(x, y + s), Point::new(x, y)]
+    }
+
+    #[test]
+    fn overcut_runs_on_past_the_start() {
+        let square = vec![Point::new(0.0, 0.0), Point::new(10.0, 0.0), Point::new(10.0, 10.0), Point::new(0.0, 10.0), Point::new(0.0, 0.0)];
+        let mut p = square.clone();
+        overcut(&mut p, 2.0, false);
+        assert_eq!(&p[5..], &[Point::new(2.0, 0.0)], "2 mm along the first edge again");
+        let mut p = square.clone();
+        overcut(&mut p, 13.0, false);
+        assert_eq!(&p[5..], &[Point::new(10.0, 0.0), Point::new(10.0, 3.0)], "round the first corner");
+        // After a lead-in, the overcut follows the outline, not the lead.
+        let mut p = vec![Point::new(-3.0, -3.0)];
+        p.extend(&square);
+        overcut(&mut p, 1.0, true);
+        assert_eq!(p.last(), Some(&Point::new(1.0, 0.0)));
     }
 
     #[test]

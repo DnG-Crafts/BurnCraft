@@ -1,6 +1,7 @@
 //! BurnCraft document model: shapes, layers (cut settings), undo history and
 //! the native project file format (`.bcproj`, JSON).
 
+pub mod check;
 pub mod constraints;
 pub mod edit;
 pub mod effects;
@@ -303,6 +304,22 @@ pub struct Layer {
     pub perf_cut: f64,
     #[serde(default = "default_perf_skip")]
     pub perf_skip: f64,
+    /// Closed cuts: carry on this far (mm) past the start, so the cut closes fully (Line modes).
+    #[serde(default)]
+    pub overcut: f64,
+    /// G-code machines: hold the laser on at the start of each cut this long (ms) before moving,
+    /// to pierce thick material, and at the end of each cut before turning it off.
+    #[serde(default)]
+    pub delay_on: f64,
+    #[serde(default)]
+    pub delay_off: f64,
+    /// Machines with a Z axis: raise (positive) or lower the head this far for the layer, in mm.
+    #[serde(default)]
+    pub z_offset: f64,
+    /// Machines with a Z axis: how far to lower the head after each pass, in mm (for cutting
+    /// deeper as the material is cut away).
+    #[serde(default)]
+    pub z_step: f64,
     /// Whether the layer is sent to the laser.
     pub output: bool,
     /// Whether the layer is drawn in the editor.
@@ -341,6 +358,11 @@ impl Layer {
             perforate: false,
             perf_cut: default_perf_cut(),
             perf_skip: default_perf_skip(),
+            overcut: 0.0,
+            delay_on: 0.0,
+            delay_off: 0.0,
+            z_offset: 0.0,
+            z_step: 0.0,
             output: !is_tool_layer(index),
             visible: true,
             custom_color: None,
@@ -555,6 +577,21 @@ pub struct Shape {
     /// Live effects, applied in order to the placed outline (see [`effects`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<effects::Effect>,
+    /// Where cutting starts and which way it runs, when set by hand (otherwise the job picks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut: Option<CutStart>,
+}
+
+/// A shape's cut start and direction, set with the Cut Start tool.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct CutStart {
+    /// Where the cut starts, in the shape's own coordinates (so it follows the shape when it's
+    /// moved, turned or resized). The nearest point of the outline is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point: Option<Point>,
+    /// Cut the other way round.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reverse: bool,
 }
 
 impl Shape {
@@ -738,7 +775,7 @@ impl Document {
     pub fn add_shape(&mut self, kind: ShapeKind, transform: Affine, layer: usize) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.shapes.push(Shape { id, kind, transform, layer: layer.min(LAYER_COUNT - 1), locked: false, group: None, effects: Vec::new() });
+        self.shapes.push(Shape { id, kind, transform, layer: layer.min(LAYER_COUNT - 1), locked: false, group: None, effects: Vec::new(), cut: None });
         id
     }
 

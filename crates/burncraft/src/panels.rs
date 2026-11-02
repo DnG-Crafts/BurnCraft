@@ -37,6 +37,27 @@ fn swatch(ui: &mut egui::Ui, index: usize, rgb: [u8; 3], size: f32) -> egui::Res
     faded_swatch(ui, index, rgb, size, 1.0)
 }
 
+/// Whether a layer is an Image layer for a LaserPecker 2, whose resolution is then picked from a
+/// drop-down instead of typing a line interval. (Fill layers keep the interval: the resolution
+/// nearest it is used.)
+fn lp2_bitmap(controller: crate::laser::ControllerKind, mode: LayerMode) -> bool {
+    controller == crate::laser::ControllerKind::Lp2 && mode == LayerMode::Image
+}
+
+/// The LaserPecker 2's bitmap resolutions as a drop-down. Each sets the layer's line interval to
+/// the matching pixel size, so the picture is prepared at exactly the resolution sent.
+fn lp2_resolution(ui: &mut egui::Ui, id: &str, interval: &mut f64) {
+    let current = bc_lp2::Resolution::for_interval(*interval);
+    egui::ComboBox::from_id_salt(id).selected_text(current.label()).show_ui(ui, |ui| {
+        for r in bc_lp2::Resolution::ALL {
+            let pixel = 1.0 / r.pixels_per_mm();
+            if ui.selectable_label(r == current, format!("{} ({pixel:.3} mm)", r.label())).on_hover_text("Finer is slower, and the file sent is bigger").clicked() {
+                *interval = pixel;
+            }
+        }
+    });
+}
+
 /// A layer colour swatch drawn at `opacity` (faded for layers with Output off).
 fn faded_swatch(ui: &mut egui::Ui, index: usize, [r, g, b]: [u8; 3], size: f32, opacity: f32) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size * 1.6, size), egui::Sense::click());
@@ -522,6 +543,7 @@ impl BurnCraftApp {
         }
         // Quick settings for the current layer.
         let cur = if used.contains(&self.current_layer) { self.current_layer } else { used[0] };
+        let controller = self.laser.settings.controller;
         ui.separator();
         egui::Grid::new("layer-quick").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
             let l = &mut layers[cur];
@@ -549,8 +571,13 @@ impl BurnCraftApp {
             ui.label("Pass Count");
             ui.add(egui::DragValue::new(&mut l.passes).range(1..=100));
             ui.end_row();
-            ui.label("Interval");
-            ui.add_enabled(l.mode != LayerMode::Line, egui::DragValue::new(&mut l.interval).range(0.01..=2.0).speed(0.005).suffix(" mm"));
+            if lp2_bitmap(controller, l.mode) {
+                ui.label("Resolution");
+                lp2_resolution(ui, "quick-lp2-resolution", &mut l.interval);
+            } else {
+                ui.label("Interval");
+                ui.add_enabled(l.mode != LayerMode::Line, egui::DragValue::new(&mut l.interval).range(0.01..=2.0).speed(0.005).suffix(" mm"));
+            }
             ui.end_row();
         });
         if ui.button("Edit cut settings…").clicked() {
@@ -578,6 +605,10 @@ impl BurnCraftApp {
     /// The Cut Settings Editor window for one layer.
     pub(crate) fn cut_editor_window(&mut self, ctx: &egui::Context) {
         let speed = self.laser.speed(self.prefs.units);
+        let controller = self.laser.settings.controller;
+        let z_axis = controller == crate::laser::ControllerKind::Grbl && self.laser.settings.z_axis;
+        // Laser on/off delays are written as G-code pauses.
+        let gcode = controller == crate::laser::ControllerKind::Grbl;
         let Some(index) = self.cut_editor else { return };
         let mut layers = self.doc.layers.clone();
         let mut open = true;
@@ -614,6 +645,14 @@ impl BurnCraftApp {
                     ui.label("Number of Passes");
                     ui.add(egui::DragValue::new(&mut l.passes).range(1..=100));
                     ui.end_row();
+                    if z_axis {
+                        ui.label("Z offset").on_hover_text("Raise (positive) or lower the laser this far for this layer, from where it's focused");
+                        ui.add(egui::DragValue::new(&mut l.z_offset).range(-50.0..=50.0).speed(0.05).suffix(" mm"));
+                        ui.end_row();
+                        ui.label("Z step per pass").on_hover_text("Lower the laser this far after each pass, to follow the cut down into thick material");
+                        ui.add_enabled(l.passes > 1, egui::DragValue::new(&mut l.z_step).range(-10.0..=10.0).speed(0.01).suffix(" mm"));
+                        ui.end_row();
+                    }
                     ui.label("Air Assist");
                     ui.checkbox(&mut l.air_assist, "");
                     ui.end_row();
@@ -663,14 +702,30 @@ impl BurnCraftApp {
                         ui.label("Lead-In");
                         ui.add(egui::DragValue::new(&mut l.lead_in).range(0.0..=20.0).speed(0.1).suffix(" mm"));
                         ui.end_row();
+                        ui.label("Overcut").on_hover_text("Closed cuts carry on this far past where they started, so the part drops out cleanly instead of hanging on at the start");
+                        ui.add(egui::DragValue::new(&mut l.overcut).range(0.0..=20.0).speed(0.05).suffix(" mm"));
+                        ui.end_row();
+                        if gcode {
+                            ui.label("Laser on delay").on_hover_text("At the start of each cut, the laser stays on this long before the head moves: pierces thick material");
+                            ui.add(egui::DragValue::new(&mut l.delay_on).range(0.0..=5000.0).speed(1.0).suffix(" ms"));
+                            ui.end_row();
+                            ui.label("Laser off delay").on_hover_text("At the end of each cut, the laser stays on this long before turning off");
+                            ui.add(egui::DragValue::new(&mut l.delay_off).range(0.0..=5000.0).speed(1.0).suffix(" ms"));
+                            ui.end_row();
+                        }
                     });
                 }
                 if l.mode != LayerMode::Line {
                     egui::Grid::new("editor-scan").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                         ui.strong(if l.mode == LayerMode::Image { "Image" } else { "Fill" });
                         ui.end_row();
-                        ui.label("Interval");
-                        ui.add(egui::DragValue::new(&mut l.interval).range(0.01..=2.0).speed(0.005).suffix(" mm"));
+                        if lp2_bitmap(controller, l.mode) {
+                            ui.label("Resolution");
+                            lp2_resolution(ui, "editor-lp2-resolution", &mut l.interval);
+                        } else {
+                            ui.label("Interval");
+                            ui.add(egui::DragValue::new(&mut l.interval).range(0.01..=2.0).speed(0.005).suffix(" mm"));
+                        }
                         ui.end_row();
                         ui.label("Lines per inch");
                         ui.label(format!("{:.0}", 25.4 / l.interval.max(0.001)));

@@ -18,7 +18,28 @@ pub struct GrblLayer {
     pub min_power: f64,
     pub max_power: f64,
     pub air_assist: bool,
+    /// How many times `paths` repeats the layer (one pass after another), so Z can step down
+    /// between passes.
+    pub passes: u32,
+    /// Z axis: the layer's offset (positive raises the head), and how far to lower it after each
+    /// pass, in mm. Only written when [`GcodeOptions::z`] is set.
+    pub z_offset: f64,
+    pub z_step: f64,
+    /// Hold the laser on this long (ms) at the start of each burn before moving, and at its end
+    /// before turning off (piercing thick material).
+    pub delay_on: f64,
+    pub delay_off: f64,
     pub paths: Vec<GrblPath>,
+}
+
+/// How the machine's Z axis is driven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ZAxis {
+    /// Move Z only by relative amounts (G91), from wherever it was focused, and come back at the
+    /// end. Otherwise Z positions are absolute, with 0 at focus.
+    pub relative: bool,
+    /// Positive Z moves the head down (or the bed up) on this machine.
+    pub reversed: bool,
 }
 
 /// Which G-code flavour the controller speaks.
@@ -111,11 +132,13 @@ pub struct GcodeOptions {
     pub air_m7: bool,
     /// Rotary on a 4th axis: write the Y coordinate as A.
     pub y_as_a: bool,
+    /// The machine has a Z axis to use for layer offsets and per-pass steps.
+    pub z: Option<ZAxis>,
 }
 
 impl Default for GcodeOptions {
     fn default() -> Self {
-        Self { s_max: 1000.0, dialect: Dialect::Grbl, custom: CustomGcode::default(), start_gcode: String::new(), end_gcode: String::new(), air_m7: false, y_as_a: false }
+        Self { s_max: 1000.0, dialect: Dialect::Grbl, custom: CustomGcode::default(), start_gcode: String::new(), end_gcode: String::new(), air_m7: false, y_as_a: false, z: None }
     }
 }
 
@@ -138,6 +161,40 @@ enum PowerStyle<'a> {
 }
 
 /// Generates the program for `layers`.
+/// A pause of `ms` milliseconds: G4 takes seconds on GRBL-style controllers and milliseconds on
+/// Marlin and Smoothieware.
+fn dwell(d: Dialect, ms: f64) -> String {
+    match d {
+        Dialect::Marlin | Dialect::Smoothieware => format!("G4 P{}", ms.round() as i64),
+        _ => format!("G4 P{}", fmt(ms / 1000.0)),
+    }
+}
+
+/// Lines that hold the laser on at power `s` for `ms`, with the head still. In GRBL's dynamic
+/// power mode (M4) the laser goes off when the head stops, so it switches to constant power (M3)
+/// for the pause and back to M4 after.
+fn hold_on(d: Dialect, c: &CustomGcode, s: &str, ms: f64) -> Vec<String> {
+    match d {
+        Dialect::Grbl => vec![format!("M3 S{s}"), dwell(d, ms), format!("M4 S{s}")],
+        Dialect::GrblM3 => vec![format!("M3 S{s}"), dwell(d, ms)],
+        Dialect::Custom if c.inline_power => vec![format!("{} S{s}", c.laser_on), dwell(d, ms)],
+        // The laser is already on (switched on by command before the burn).
+        _ => vec![dwell(d, ms)],
+    }
+}
+
+/// Moves Z from `from` to `to` (mm above focus): relative (G91) or absolute.
+fn z_move(out: &mut Vec<String>, axis: ZAxis, from: f64, to: f64) {
+    let sign = if axis.reversed { -1.0 } else { 1.0 };
+    if axis.relative {
+        out.push("G91".into());
+        out.push(format!("G0 Z{}", fmt(sign * (to - from))));
+        out.push("G90".into());
+    } else {
+        out.push(format!("G0 Z{}", fmt(sign * to)));
+    }
+}
+
 pub fn generate(layers: &[GrblLayer], options: &GcodeOptions) -> Vec<String> {
     let d = options.dialect;
     let c = &options.custom;
@@ -169,6 +226,8 @@ pub fn generate(layers: &[GrblLayer], options: &GcodeOptions) -> Vec<String> {
     let mut laser_on = false;
     let mut pos: Option<(f64, f64)> = None;
     let mut air: Option<bool> = None;
+    // Where Z is, relative to focus (positive = head raised).
+    let mut z = 0.0;
     for layer in layers {
         if air != Some(layer.air_assist) {
             if !(air_on.is_empty() && air_off.is_empty()) {
@@ -177,7 +236,27 @@ pub fn generate(layers: &[GrblLayer], options: &GcodeOptions) -> Vec<String> {
             air = Some(layer.air_assist);
         }
         let layer_feed = (layer.speed * 60.0).round() as i64;
-        for path in layer.paths.iter().filter(|p| p.points.len() >= 2) {
+        let passes = layer.passes.max(1) as usize;
+        let per_pass = if layer.paths.len() % passes == 0 { (layer.paths.len() / passes).max(1) } else { layer.paths.len().max(1) };
+        for (i, path) in layer.paths.iter().enumerate() {
+            if let Some(axis) = options.z
+                && i % per_pass == 0
+            {
+                let target = layer.z_offset - layer.z_step * (i / per_pass) as f64;
+                if (target - z).abs() > 1e-6 {
+                    if let PowerStyle::Commands { off, .. } = style
+                        && laser_on
+                    {
+                        out.push(off.to_string());
+                        laser_on = false;
+                    }
+                    z_move(&mut out, axis, z, target);
+                    z = target;
+                }
+            }
+            if path.points.len() < 2 {
+                continue;
+            }
             let s = if path.power <= 0.0 {
                 0.0
             } else {
@@ -205,6 +284,11 @@ pub fn generate(layers: &[GrblLayer], options: &GcodeOptions) -> Vec<String> {
                     laser_on = false;
                 }
             }
+            let burning = path.power > 0.0;
+            if burning && layer.delay_on > 0.0 {
+                out.extend(hold_on(d, c, &s, layer.delay_on));
+                s_value = Some(s.clone());
+            }
             for &(x, y) in &path.points[1..] {
                 let mut line = format!("G1 X{} {y_letter}{}", fmt(x), fmt(y));
                 if matches!(style, PowerStyle::Inline) && s_value.as_deref() != Some(s.as_str()) {
@@ -217,8 +301,18 @@ pub fn generate(layers: &[GrblLayer], options: &GcodeOptions) -> Vec<String> {
                 }
                 out.push(line);
             }
+            if burning && layer.delay_off > 0.0 {
+                out.extend(hold_on(d, c, &s, layer.delay_off));
+                s_value = Some(s.clone());
+            }
             pos = Some(*path.points.last().unwrap());
         }
+    }
+    if let Some(axis) = options.z
+        && z.abs() > 1e-6
+    {
+        // Back to focus, where the job started.
+        z_move(&mut out, axis, z, 0.0);
     }
     match (&style, d) {
         (PowerStyle::Commands { off, .. }, _) => out.push(off.to_string()),
@@ -242,7 +336,38 @@ mod tests {
     use super::*;
 
     fn layer(paths: Vec<GrblPath>) -> GrblLayer {
-        GrblLayer { speed: 50.0, min_power: 10.0, max_power: 60.0, air_assist: true, paths }
+        GrblLayer { speed: 50.0, min_power: 10.0, max_power: 60.0, air_assist: true, passes: 1, z_offset: 0.0, z_step: 0.0, delay_on: 0.0, delay_off: 0.0, paths }
+    }
+
+    #[test]
+    fn delays_hold_the_laser_on_at_each_end_of_a_burn() {
+        let l = GrblLayer { delay_on: 250.0, delay_off: 100.0, ..layer(vec![sq()]) };
+        let out = generate(std::slice::from_ref(&l), &GcodeOptions::default());
+        let first_g1 = out.iter().position(|s| s.starts_with("G1")).unwrap();
+        // GRBL M4: constant power for the pause, seconds for G4.
+        assert_eq!(&out[first_g1 - 3..first_g1], ["M3 S600", "G4 P0.25", "M4 S600"]);
+        let last_g1 = out.iter().rposition(|s| s.starts_with("G1")).unwrap();
+        assert_eq!(&out[last_g1 + 1..last_g1 + 4], ["M3 S600", "G4 P0.1", "M4 S600"]);
+        assert!(!out[first_g1].contains(" S"), "the power is already set: {}", out[first_g1]);
+        // Marlin: the laser is switched on by command already; G4 takes milliseconds.
+        let marlin = generate(std::slice::from_ref(&l), &GcodeOptions { dialect: Dialect::Marlin, s_max: 255.0, ..Default::default() });
+        let first_g1 = marlin.iter().position(|s| s.starts_with("G1")).unwrap();
+        assert_eq!(&marlin[first_g1 - 2..first_g1], ["M3 S153", "G4 P250"]);
+        // No delays: no pauses.
+        assert!(!generate(&[layer(vec![sq()])], &GcodeOptions::default()).iter().any(|s| s.starts_with("G4")));
+    }
+
+    #[test]
+    fn z_offset_and_steps_between_passes() {
+        // Two passes of the square, 2 mm up for the layer, 0.5 mm down after the first pass.
+        let l = GrblLayer { passes: 2, z_offset: 2.0, z_step: 0.5, ..layer(vec![sq(), sq()]) };
+        let zs = |o: &GcodeOptions| generate(std::slice::from_ref(&l), o).into_iter().filter(|s| s.contains('Z') || s.starts_with("G9")).collect::<Vec<_>>();
+        let relative = GcodeOptions { z: Some(ZAxis { relative: true, reversed: false }), ..Default::default() };
+        assert_eq!(zs(&relative), ["G90", "G91", "G0 Z2", "G90", "G91", "G0 Z-0.5", "G90", "G91", "G0 Z-1.5", "G90"], "up 2, down 0.5, then back to focus");
+        let absolute = GcodeOptions { z: Some(ZAxis { relative: false, reversed: true }), ..Default::default() };
+        assert_eq!(zs(&absolute), ["G90", "G0 Z-2", "G0 Z-1.5", "G0 Z0"], "reversed: positive Z is down");
+        // Without a Z axis nothing changes.
+        assert!(zs(&GcodeOptions::default()).iter().all(|s| !s.contains('Z')));
     }
 
     fn sq() -> GrblPath {

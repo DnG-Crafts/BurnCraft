@@ -537,6 +537,111 @@ impl OffsetDialog {
     }
 }
 
+/// Check Design: lists what would spoil the job, with a way to select (and often fix) each.
+#[derive(Default)]
+pub struct CheckDialog {
+    /// The design revision the findings are for (checked again when the design changes).
+    revision: Option<u64>,
+    findings: Vec<bc_doc::check::Finding>,
+}
+
+pub enum CheckAction {
+    Select(std::collections::BTreeSet<u64>),
+    Fix(bc_doc::check::Problem, std::collections::BTreeSet<u64>),
+    Close,
+}
+
+impl CheckDialog {
+    pub fn ui(&mut self, ctx: &egui::Context, doc: &bc_doc::Document, revision: u64) -> Option<CheckAction> {
+        use bc_doc::check::Problem;
+        if self.revision != Some(revision) {
+            self.findings = bc_doc::check::check(doc, doc.bed_size);
+            self.revision = Some(revision);
+        }
+        let mut out = None;
+        window(ctx, "Check Design").show(ctx, |ui| {
+            ui.set_width(460.0);
+            if self.findings.is_empty() {
+                ui.label("No problems found.");
+            }
+            egui::Grid::new("check-findings").num_columns(3).spacing([8.0, 6.0]).show(ui, |ui| {
+                for f in &self.findings {
+                    ui.add(egui::Label::new(format!("{} {}", f.shapes.len(), f.problem.describe())).wrap());
+                    if ui.button("Select").clicked() {
+                        out = Some(CheckAction::Select(f.shapes.clone()));
+                    }
+                    let fix = match f.problem {
+                        Problem::OpenOnFill | Problem::OpenOnLine => Some(("Close", "Join each shape's ends with a straight line")),
+                        Problem::Duplicate => Some(("Delete copies", "Delete the extra copies, keeping one of each")),
+                        Problem::Tiny => Some(("Delete", "Delete these shapes")),
+                        Problem::Overlap | Problem::Outside => None,
+                    };
+                    match fix {
+                        Some((label, about)) => {
+                            if ui.button(label).on_hover_text(about).clicked() {
+                                out = Some(CheckAction::Fix(f.problem, f.shapes.clone()));
+                            }
+                        }
+                        None => {
+                            ui.label("");
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.weak("Only layers with Output on are checked. The list updates as you edit.");
+            ui.separator();
+            if ui.button("Close").clicked() {
+                out = Some(CheckAction::Close);
+            }
+        });
+        out
+    }
+}
+
+/// Cut Box: a rectangle around the selection (or the whole design) to cut the piece free.
+pub struct CutBoxDialog {
+    pub margin: f64,
+    pub radius: f64,
+    /// The layer for the box, or None for a new layer that cuts after all the others.
+    pub layer: Option<usize>,
+}
+
+impl CutBoxDialog {
+    /// `layers` are the design's layers, with their names, to choose from.
+    pub fn ui(&mut self, ctx: &egui::Context, layers: &[(usize, String)], selection: bool) -> Option<Outcome> {
+        let mut out = None;
+        window(ctx, "Cut Box").show(ctx, |ui| {
+            ui.label(if selection { "Adds a rectangle around the selected shapes, to cut them free." } else { "Adds a rectangle around the whole design, to cut it free." });
+            egui::Grid::new("cut-box").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("Margin");
+                ui.add(egui::DragValue::new(&mut self.margin).range(0.0..=100.0).speed(0.1).suffix(" mm"));
+                ui.end_row();
+                ui.label("Corner radius");
+                ui.add(egui::DragValue::new(&mut self.radius).range(0.0..=100.0).speed(0.1).suffix(" mm"));
+                ui.end_row();
+                ui.label("Layer");
+                let shown = match self.layer {
+                    None => "New layer (cuts last)".to_string(),
+                    Some(i) => layers.iter().find(|(j, _)| *j == i).map(|(_, n)| n.clone()).unwrap_or_default(),
+                };
+                egui::ComboBox::from_id_salt("cut-box-layer").selected_text(shown).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.layer, None, "New layer (cuts last)");
+                    for (i, name) in layers {
+                        ui.selectable_value(&mut self.layer, Some(*i), name);
+                    }
+                });
+                ui.end_row();
+            });
+            if self.layer.is_none() {
+                ui.weak("Set the new layer's speed and power to cut through your material.");
+            }
+            out = ok_cancel(ui, "Add", true);
+        });
+        out
+    }
+}
+
 /// Place on Each Slot: copies the design onto every jig slot.
 pub struct PlaceSlotsDialog {
     pub slots: usize,
@@ -1108,28 +1213,89 @@ pub enum PreviewAction {
 pub struct Preview {
     pub job: Job,
     pub title: String,
-    /// How much of the job to draw, 0..=1.
+    /// How far through the job's running time to show, 0..=1.
     progress: f32,
     show_travel: bool,
     stats: bc_job::JobStats,
+    rapid_speed: f64,
+    /// Simulation: playing, how many times real speed, and the UI time of the last step.
+    playing: bool,
+    play_speed: f32,
+    last_tick: Option<f64>,
     /// Show the job burned into a material instead of as lines.
     realistic: bool,
     material: bc_job::render::Material,
-    /// The last realistic picture: (material, progress in %, texture, area it covers).
+    /// The last realistic picture: (material, progress key, texture, area it covers).
     picture: Option<(bc_job::render::Material, u32, egui::TextureHandle, bc_geom::Rect)>,
-    /// The last Lines picture: (progress in ‰, show travel, size in px, texture, head position).
-    lines: Option<(u32, bool, [usize; 2], egui::TextureHandle, Point)>,
+    /// The last Lines picture: (progress key, show travel, size in px, texture).
+    lines: Option<(u32, bool, [usize; 2], egui::TextureHandle)>,
+    /// When the picture was last drawn (UI time) and how long that took (s), to keep playback
+    /// smooth on big jobs by drawing the picture less often (the head marker moves every frame).
+    drawn_at: f64,
+    draw_cost: f64,
 }
+
+/// Playback speeds offered, as multiples of the real job speed.
+const PLAY_SPEEDS: [f32; 7] = [1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0];
 
 impl Preview {
     pub fn new(job: Job, title: String, rapid_speed: f64) -> Self {
         let stats = job.stats(Point::ORIGIN, rapid_speed);
-        Self { job, title, progress: 1.0, show_travel: true, stats, realistic: false, material: bc_job::render::Material::Plywood, picture: None, lines: None }
+        Self {
+            job,
+            title,
+            progress: 1.0,
+            show_travel: true,
+            stats,
+            rapid_speed,
+            playing: false,
+            play_speed: 1.0,
+            last_tick: None,
+            realistic: false,
+            material: bc_job::render::Material::Plywood,
+            picture: None,
+            lines: None,
+            drawn_at: f64::NEG_INFINITY,
+            draw_cost: 0.0,
+        }
     }
 
-    pub fn ui(&mut self, ctx: &egui::Context, bed: (f64, f64), connected: bool) -> Option<PreviewAction> {
+    /// The progress as a key for redrawing (pictures are redrawn when it changes).
+    fn key(&self) -> u32 {
+        (self.progress * 1_000_000.0).round() as u32
+    }
+
+    /// Whether the picture may be redrawn now: always when stopped; while playing, as often as
+    /// drawing it allows.
+    fn may_draw(&self, now: f64) -> bool {
+        !self.playing || now - self.drawn_at >= (1.0 / 30.0f64).max(3.0 * self.draw_cost)
+    }
+
+    /// Moves the simulation on to `now` (UI seconds).
+    fn tick(&mut self, now: f64) {
+        if !self.playing {
+            self.last_tick = None;
+            return;
+        }
+        if let Some(last) = self.last_tick {
+            let total = self.stats.seconds.max(1e-3);
+            self.progress = (self.progress as f64 + (now - last) * self.play_speed as f64 / total).min(1.0) as f32;
+            if self.progress >= 1.0 {
+                self.playing = false;
+            }
+        }
+        self.last_tick = Some(now);
+    }
+
+    pub fn ui(&mut self, ctx: &egui::Context, bed: (f64, f64), connected: bool, speed: crate::units::Speed) -> Option<PreviewAction> {
         let mut out = None;
         let mut open = true;
+        let now = ctx.input(|i| i.time);
+        self.tick(now);
+        if self.playing {
+            ctx.request_repaint();
+        }
+        let moment = self.job.moment(Point::ORIGIN, self.rapid_speed, self.progress as f64);
         centered(ctx, format!("Preview: {}", self.title)).id(egui::Id::new("preview-window")).open(&mut open).default_size([760.0, 600.0]).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!(
@@ -1146,7 +1312,30 @@ impl Preview {
             }
             let mut scrubbing = false;
             ui.horizontal(|ui| {
-                scrubbing = ui.add(egui::Slider::new(&mut self.progress, 0.0..=1.0).show_value(false).text("progress")).dragged();
+                let play = if self.playing { "⏸ Pause" } else { "▶ Play" };
+                if ui.button(play).on_hover_text("Simulate the job: the head moves along the job as the laser would").clicked() {
+                    if !self.playing && self.progress >= 1.0 {
+                        self.progress = 0.0;
+                    }
+                    self.playing = !self.playing;
+                }
+                if ui.button("■ Stop").on_hover_text("Stop and go back to the start").clicked() {
+                    self.playing = false;
+                    self.progress = 0.0;
+                }
+                let r = ui.add(egui::Slider::new(&mut self.progress, 0.0..=1.0).show_value(false));
+                if r.dragged() {
+                    scrubbing = true;
+                    self.playing = false;
+                }
+                egui::ComboBox::from_id_salt("preview-play-speed").width(56.0).selected_text(format!("{}×", self.play_speed)).show_ui(ui, |ui| {
+                    for s in PLAY_SPEEDS {
+                        ui.selectable_value(&mut self.play_speed, s, format!("{s}×"));
+                    }
+                }).response.on_hover_text("Simulation speed");
+                ui.monospace(format!("{} / {}", format_clock(self.progress as f64 * self.stats.seconds), format_clock(self.stats.seconds)));
+            });
+            ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.realistic, false, "Lines");
                 ui.selectable_value(&mut self.realistic, true, "Realistic").on_hover_text("The job burned into a material; darkness follows each layer's power, speed and passes");
                 if self.realistic {
@@ -1158,13 +1347,15 @@ impl Preview {
                 } else {
                     ui.checkbox(&mut self.show_travel, "Show travel");
                 }
+                ui.separator();
+                ui.label(self.status(&moment, speed));
             });
             let size = ui.available_size() - egui::vec2(0.0, 36.0);
             let (rect, _) = ui.allocate_exact_size(size.max(egui::vec2(200.0, 150.0)), egui::Sense::hover());
             if self.realistic {
-                self.draw_realistic(ui, rect, scrubbing);
+                self.draw_realistic(ui, rect, scrubbing, &moment, now);
             } else {
-                self.draw_lines(ui, rect, bed, scrubbing);
+                self.draw_lines(ui, rect, bed, scrubbing, &moment, now);
             }
             ui.horizontal(|ui| {
                 if ui.add_enabled(connected, egui::Button::new("Frame")).clicked() { out = Some(PreviewAction::Frame); }
@@ -1180,22 +1371,34 @@ impl Preview {
         out
     }
 
-    /// The job burned into the chosen material, zoomed to the job. Re-rendered when the material
-    /// or progress changes (not while the progress slider is being dragged).
-    fn draw_realistic(&mut self, ui: &egui::Ui, rect: egui::Rect, scrubbing: bool) {
+    /// What the head is doing at `m`: the layer, cutting or moving, and the layer's speed and power.
+    fn status(&self, m: &bc_job::Moment, speed: crate::units::Speed) -> String {
+        let Some(layer) = m.layer.and_then(|i| self.job.layers.get(i)) else {
+            return if self.progress >= 1.0 { "Finished".into() } else { "Ready".into() };
+        };
+        let what = if m.along.is_some() { "cutting" } else { "moving" };
+        let s = &layer.settings;
+        format!("Layer {} {what} · {} · {:.0}%", bc_doc::layer_label(layer.index), speed.format(s.speed), s.max_power)
+    }
+
+    /// The job burned into the chosen material, zoomed to the job. Redrawn when the material or
+    /// progress changes (not while the progress slider is being dragged).
+    fn draw_realistic(&mut self, ui: &egui::Ui, rect: egui::Rect, scrubbing: bool, moment: &bc_job::Moment, now: f64) {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::from_gray(40));
         let Some((a, b)) = self.job.bounds() else { return };
-        let percent = (self.progress * 100.0).round() as u32;
-        let stale = self.picture.as_ref().is_none_or(|(m, p, _, _)| *m != self.material || *p != percent);
-        if stale && !scrubbing {
+        let key = self.key();
+        let stale = self.picture.as_ref().is_none_or(|(m, k, _, _)| *m != self.material || *k != key);
+        if stale && !scrubbing && self.may_draw(now) {
             let area = bc_geom::Rect::new(a.x, a.y, b.x, b.y).inflate(4.0, 4.0);
             // Up to 10 px/mm, and at most ~1800 px across.
             let k = (1800.0 / area.width().max(area.height())).min(10.0);
-            let pic = bc_job::render::render(&self.job, area, k, self.material, self.progress);
+            let started = std::time::Instant::now();
+            let pic = bc_job::render::render(&self.job, area, k, self.material, moment);
             let image = egui::ColorImage::from_rgb([pic.width, pic.height], &pic.rgb);
             let tex = ui.ctx().load_texture("burn-preview", image, egui::TextureOptions::LINEAR);
-            self.picture = Some((self.material, percent, tex, pic.area));
+            self.picture = Some((self.material, key, tex, pic.area));
+            (self.drawn_at, self.draw_cost) = (now, started.elapsed().as_secs_f64());
         }
         let Some((_, _, tex, area)) = &self.picture else { return };
         let aspect = (area.width() / area.height()) as f32;
@@ -1207,14 +1410,19 @@ impl Preview {
         }
         let shown = egui::Rect::from_center_size(rect.center(), size);
         painter.image(tex.id(), shown, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
-        if stale {
+        if self.progress < 1.0 {
+            let scale = shown.width() / area.width() as f32;
+            let at = shown.min + egui::vec2((moment.head.x - area.x0) as f32, (moment.head.y - area.y0) as f32) * scale;
+            painter.circle_stroke(at, 4.0, Stroke::new(1.5, Color32::RED));
+        }
+        if stale && scrubbing {
             painter.text(shown.left_top() + egui::vec2(6.0, 6.0), egui::Align2::LEFT_TOP, "release to update", egui::FontId::proportional(12.0), Color32::WHITE);
         }
     }
 
     /// The job as lines on the bed, rendered into a picture at the window's resolution (photos are
     /// millions of short runs: far too many to hand to the GPU one by one).
-    fn draw_lines(&mut self, ui: &egui::Ui, rect: egui::Rect, bed: (f64, f64), scrubbing: bool) {
+    fn draw_lines(&mut self, ui: &egui::Ui, rect: egui::Rect, bed: (f64, f64), scrubbing: bool, moment: &bc_job::Moment, now: f64) {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::from_gray(250));
         let scale = ((rect.width() - 20.0) / bed.0 as f32).min((rect.height() - 20.0) / bed.1 as f32).max(0.01);
@@ -1222,24 +1430,32 @@ impl Preview {
         let ppp = ui.ctx().pixels_per_point();
         let px_per_mm = (scale * ppp) as f64;
         let size = [((bed.0 * px_per_mm).ceil() as usize).max(1), ((bed.1 * px_per_mm).ceil() as usize).max(1)];
-        let permille = (self.progress * 1000.0).round() as u32;
-        let stale = self.lines.as_ref().is_none_or(|(p, t, s, _, _)| *p != permille || *t != self.show_travel || *s != size);
-        if stale && (!scrubbing || self.lines.is_none()) {
+        let key = self.key();
+        let stale = self.lines.as_ref().is_none_or(|(k, t, s, _)| *k != key || *t != self.show_travel || *s != size);
+        if stale && (!scrubbing || self.lines.is_none()) && self.may_draw(now) {
             let area = bc_geom::Rect::new(0.0, 0.0, bed.0, bed.1);
-            let (pic, head) = bc_job::render::render_lines(&self.job, area, px_per_mm, self.progress, self.show_travel);
+            let started = std::time::Instant::now();
+            let pic = bc_job::render::render_lines(&self.job, area, px_per_mm, moment, self.show_travel);
             let image = egui::ColorImage::from_rgb([pic.width, pic.height], &pic.rgb);
             let tex = ui.ctx().load_texture("preview-lines", image, egui::TextureOptions::LINEAR);
-            self.lines = Some((permille, self.show_travel, size, tex, head));
+            self.lines = Some((key, self.show_travel, size, tex));
+            (self.drawn_at, self.draw_cost) = (now, started.elapsed().as_secs_f64());
         }
-        let Some((_, _, _, tex, head)) = &self.lines else { return };
+        let Some((_, _, _, tex)) = &self.lines else { return };
         painter.image(tex.id(), shown, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
         painter.rect_stroke(shown, 0.0, Stroke::new(1.0, Color32::GRAY), egui::StrokeKind::Middle);
-        let at = shown.min + egui::vec2(head.x as f32, head.y as f32) * scale;
+        let at = shown.min + egui::vec2(moment.head.x as f32, moment.head.y as f32) * scale;
         painter.circle_stroke(at, 4.0, Stroke::new(1.5, Color32::RED));
         if stale && scrubbing {
             painter.text(shown.left_top() + egui::vec2(6.0, 6.0), egui::Align2::LEFT_TOP, "release to update", egui::FontId::proportional(12.0), Color32::DARK_GRAY);
         }
     }
+}
+
+/// A time as h:mm:ss, or m:ss under an hour.
+fn format_clock(seconds: f64) -> String {
+    let s = seconds.max(0.0).round() as u64;
+    if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
 }
 
 pub fn format_duration(seconds: f64) -> String {
@@ -1262,6 +1478,29 @@ mod tests {
         let (min, max) = job.bounds().unwrap();
         assert_eq!(min, Point::new(10.0, 10.0));
         assert!((max.x - (10.0 + 4.0 * 8.0 + 3.0 * 2.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn simulation_plays_in_job_time() {
+        // One 100 mm line at 100 mm/s, starting at the origin: 1 s of cutting.
+        let mut settings = bc_doc::Layer::new(0);
+        settings.speed = 100.0;
+        let line = bc_job::JobPath::burn(vec![Point::new(0.0, 0.0), Point::new(100.0, 0.0)]);
+        let job = Job { layers: vec![bc_job::JobLayer { index: 0, settings, paths: vec![line] }], skipped: Vec::new() };
+        let mut p = Preview::new(job, "t".into(), 200.0);
+        (p.progress, p.playing, p.play_speed) = (0.0, true, 2.0);
+        p.tick(10.0);
+        p.tick(10.25);
+        assert!((p.progress - 0.5).abs() < 1e-6, "a quarter second at 2× is half the job: {}", p.progress);
+        p.playing = false;
+        p.tick(11.0);
+        assert!((p.progress - 0.5).abs() < 1e-6, "paused");
+        p.playing = true;
+        p.tick(20.0);
+        p.tick(25.0);
+        assert_eq!((p.progress, p.playing), (1.0, false), "stops at the end");
+        assert_eq!(format_clock(65.4), "1:05");
+        assert_eq!(format_clock(3725.0), "1:02:05");
     }
 
     #[test]

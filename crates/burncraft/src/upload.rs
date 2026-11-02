@@ -217,7 +217,7 @@ impl Upload {
 
 /// The picture as a shape whose top-left is at the origin (for tracing it in mm).
 fn picture_shape(png: &[u8], w: f64, h: f64) -> bc_doc::Shape {
-    bc_doc::Shape { id: 0, kind: bc_doc::ShapeKind::image(png, w, h), transform: Affine::translate((w / 2.0, h / 2.0)), layer: 0, locked: false, group: None, effects: Vec::new() }
+    bc_doc::Shape { id: 0, kind: bc_doc::ShapeKind::image(png, w, h), transform: Affine::translate((w / 2.0, h / 2.0)), layer: 0, locked: false, group: None, effects: Vec::new(), cut: None }
 }
 
 /// Cut lines round the parts of the picture darker than `threshold`, as Trace Image makes them,
@@ -293,7 +293,7 @@ mod diagnostics {
         let mut u = Upload::new("x".into(), bytes, (200.0, 200.0));
         u.remove_background = true;
         u.refresh();
-        let shape = bc_doc::Shape { id: 0, kind: bc_doc::ShapeKind::image(&u.png, 200.0, 200.0), transform: Affine::translate((100.0, 100.0)), layer: 0, locked: false, group: None, effects: Vec::new() };
+        let shape = bc_doc::Shape { id: 0, kind: bc_doc::ShapeKind::image(&u.png, 200.0, 200.0), transform: Affine::translate((100.0, 100.0)), layer: 0, locked: false, group: None, effects: Vec::new(), cut: None };
         let traced = bc_job::trace_image_with(&shape, &bc_job::TraceSettings::default()).unwrap();
         let lines = bc_geom::flatten(&traced, 0.02);
         println!("{} outlines", lines.len());

@@ -351,12 +351,17 @@ pub fn reorder(doc: &mut Document, sel: &Selection, how: Order) {
     }
 }
 
-/// Splits each selected shape into one shape per subpath. Returns the new selection.
+/// Splits each selected shape into one shape per subpath, or, for a shape that is a single
+/// outline (a rectangle, say), into its separate lines and curves. Returns the new selection.
 pub fn break_apart(doc: &mut Document, sel: &Selection) -> Selection {
     let targets: Vec<_> = doc.shapes.iter().filter(|s| sel.contains(&s.id) && !matches!(s.kind, ShapeKind::Image { .. })).cloned().collect();
     let mut out: Selection = sel.iter().copied().filter(|id| !targets.iter().any(|t| t.id == *id)).collect();
     for shape in targets {
-        let parts = split_subpaths(&shape.world_path());
+        let path = shape.world_path();
+        let mut parts = split_subpaths(&path);
+        if parts.len() < 2 {
+            parts = split_segments(&path);
+        }
         if parts.len() < 2 {
             out.insert(shape.id);
             continue;
@@ -367,6 +372,24 @@ pub fn break_apart(doc: &mut Document, sel: &Selection) -> Selection {
         }
     }
     out
+}
+
+/// Each line and curve of `path` as its own open path (zero-length pieces left out).
+fn split_segments(path: &BezPath) -> Vec<BezPath> {
+    use bc_geom::ParamCurve;
+    path.segments()
+        .filter(|seg| seg.start().distance(seg.end()) > 1e-9 || !matches!(seg, bc_geom::PathSeg::Line(_)))
+        .map(|seg| {
+            let mut p = BezPath::new();
+            p.move_to(seg.start());
+            match seg {
+                bc_geom::PathSeg::Line(l) => p.line_to(l.p1),
+                bc_geom::PathSeg::Quad(q) => p.quad_to(q.p1, q.p2),
+                bc_geom::PathSeg::Cubic(c) => p.curve_to(c.p1, c.p2, c.p3),
+            }
+            p
+        })
+        .collect()
 }
 
 fn split_subpaths(path: &BezPath) -> Vec<BezPath> {
@@ -531,8 +554,8 @@ pub fn dock(doc: &mut Document, sel: &Selection, side: Side, gap: f64) {
     }
 }
 
-/// Removes shapes that exactly duplicate an earlier shape (same layer and geometry within 0.01 mm).
-pub fn delete_duplicates(doc: &mut Document) -> usize {
+/// Shapes that exactly duplicate an earlier shape (same layer and geometry within 0.01 mm).
+pub fn find_duplicates(doc: &Document) -> Selection {
     let mut seen: Vec<(usize, Vec<Point>)> = Vec::new();
     let mut dupes = Selection::new();
     for s in &doc.shapes {
@@ -544,7 +567,22 @@ pub fn delete_duplicates(doc: &mut Document) -> usize {
             seen.push((s.layer, pts));
         }
     }
+    dupes
+}
+
+/// Removes shapes that exactly duplicate an earlier shape (see [`find_duplicates`]).
+pub fn delete_duplicates(doc: &mut Document) -> usize {
+    let dupes = find_duplicates(doc);
     doc.remove_where(|id| dupes.contains(&id))
+}
+
+/// Adds a rectangle around `ids` (all shapes if empty), `margin` mm outside them, with rounded
+/// corners of `radius`, on `layer`: for cutting a piece free after engraving it. Returns its id.
+pub fn cut_box(doc: &mut Document, ids: &Selection, margin: f64, radius: f64, layer: usize) -> Option<u64> {
+    let all: Selection = doc.shapes.iter().filter(|s| !crate::is_tool_layer(s.layer)).map(|s| s.id).collect();
+    let b = doc.bounds_of(if ids.is_empty() { all } else { ids.clone() })?.inflate(margin, margin);
+    let kind = ShapeKind::Rect { width: b.width(), height: b.height(), corner_radius: radius.max(0.0) };
+    Some(doc.add_shape(kind, Affine::translate(b.center().to_vec2()), layer))
 }
 
 /// Rounds corners: rectangles get a corner radius; polygons, stars and straight-edged paths
@@ -1436,6 +1474,37 @@ mod tests {
         let joined = auto_join(&mut doc, &parts, 0.01);
         assert_eq!(joined.len(), 1);
         assert_eq!(bc_geom::nodes::handles(&doc.shapes[0].local_path()).len(), 3);
+    }
+
+    #[test]
+    fn cut_box_surrounds_the_design() {
+        let mut doc = Document::default();
+        let a = doc.add_shape(ShapeKind::Rect { width: 20.0, height: 10.0, corner_radius: 0.0 }, Affine::translate((50.0, 50.0)), 0);
+        doc.add_shape(ShapeKind::Ellipse { radius_x: 5.0, radius_y: 5.0 }, Affine::translate((100.0, 50.0)), 1);
+        // A guide on a tool layer isn't part of the design.
+        doc.add_shape(ShapeKind::Rect { width: 500.0, height: 500.0, corner_radius: 0.0 }, Affine::translate((250.0, 250.0)), crate::CUT_LAYER_COUNT);
+        let all = cut_box(&mut doc, &Selection::new(), 2.0, 1.0, 3).unwrap();
+        let b = doc.shape(all).unwrap().bounds().unwrap();
+        assert_eq!((b.x0, b.y0, b.x1, b.y1), (38.0, 43.0, 107.0, 57.0));
+        assert_eq!(doc.shape(all).unwrap().layer, 3);
+        let one = cut_box(&mut doc, &Selection::from([a]), 0.0, 0.0, 3).unwrap();
+        let b = doc.shape(one).unwrap().bounds().unwrap();
+        assert_eq!((b.x0, b.y0, b.x1, b.y1), (40.0, 45.0, 60.0, 55.0));
+    }
+
+    #[test]
+    fn breaking_a_rectangle_gives_its_four_sides() {
+        use bc_geom::ParamCurve;
+        let mut doc = Document::default();
+        let id = doc.add_shape(ShapeKind::Rect { width: 20.0, height: 10.0, corner_radius: 0.0 }, Affine::translate((50.0, 50.0)), 2);
+        let parts = break_apart(&mut doc, &Selection::from([id]));
+        assert_eq!(parts.len(), 4);
+        assert!(doc.shapes.iter().all(|s| s.layer == 2 && !s.is_closed()));
+        let total: f64 = doc.shapes.iter().flat_map(|s| s.world_path().segments().collect::<Vec<_>>()).map(|g| g.start().distance(g.end())).sum();
+        assert!((total - 60.0).abs() < 1e-6, "{total}");
+        // A single line can't be broken further.
+        let line = doc.add_shape(ShapeKind::Path(bc_geom::polyline_path(&[Point::new(0.0, 0.0), Point::new(5.0, 0.0)], false)), Affine::IDENTITY, 0);
+        assert_eq!(break_apart(&mut doc, &Selection::from([line])), Selection::from([line]));
     }
 
     #[test]

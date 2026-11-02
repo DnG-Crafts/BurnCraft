@@ -50,6 +50,10 @@ pub enum Command {
     CopyAlongPath,
     UnclipImage,
     DeleteDuplicates,
+    CheckDesign,
+    ReverseCutDirection,
+    ResetCutStart,
+    CutBox,
     // Arrange
     Align(Align),
     Distribute(bool),
@@ -156,6 +160,10 @@ impl Command {
             CopyAlongPath => "Copy Along Path…".into(),
             UnclipImage => "Remove Image Clip".into(),
             DeleteDuplicates => "Delete Duplicates".into(),
+            CheckDesign => "Check Design…".into(),
+            ReverseCutDirection => "Reverse Cut Direction".into(),
+            ResetCutStart => "Reset Cut Start".into(),
+            CutBox => "Cut Box…".into(),
             Align(a) => match a {
                 bc_doc::edit::Align::Left => "Align Left",
                 bc_doc::edit::Align::HCenter => "Align Horizontal Centres",
@@ -303,9 +311,9 @@ impl BurnCraftApp {
             Redo => self.history.can_redo(),
             SplitText => self.selection.iter().filter_map(|id| self.doc.shape(*id)).any(|s| matches!(s.kind, ShapeKind::Text { .. }) && !s.locked),
             Cut | Copy | Duplicate | Delete | Lock | Unlock | ConvertToPath | Mirror(_) | Rotate(_) | MoveToBedCenter | Order(_) | GridArray | CircularArray | Nest | Offset
-            | BreakApart | ClosePaths | ReversePath | ZoomToSelection | Ungroup | RoundCorners => n > 0,
+            | BreakApart | ClosePaths | ReversePath | ReverseCutDirection | ResetCutStart | ZoomToSelection | Ungroup | RoundCorners => n > 0,
             Paste | PasteInPlace => !self.clipboard.is_empty(),
-            ExportSvg | ExportDxf | SelectAll | InvertSelection | DeleteDuplicates | SelectOpenShapes | SelectCurrentLayer => !self.doc.shapes.is_empty(),
+            ExportSvg | ExportDxf | SelectAll | InvertSelection | DeleteDuplicates | CheckDesign | CutBox | SelectOpenShapes | SelectCurrentLayer => !self.doc.shapes.is_empty(),
             Group | Boolean(_) | AutoJoin => n > 1,
             Align(_) | MakeSameWidth | MakeSameHeight | Dock(_) => units > 1,
             Distribute(_) => units > 2,
@@ -475,6 +483,22 @@ impl BurnCraftApp {
             UnclipImage => self.edit_named(&label, |doc, sel| {
                 edit::unclip_images(doc, sel);
             }),
+            CheckDesign => self.dialog = Some(Dialog::Check(crate::dialogs::CheckDialog::default())),
+            ReverseCutDirection => self.edit_named(&label, |doc, sel| {
+                for s in doc.shapes.iter_mut().filter(|s| sel.contains(&s.id)) {
+                    let cut = s.cut.get_or_insert_default();
+                    cut.reverse = !cut.reverse;
+                    if *cut == bc_doc::CutStart::default() {
+                        s.cut = None;
+                    }
+                }
+            }),
+            ResetCutStart => self.edit_named(&label, |doc, sel| {
+                for s in doc.shapes.iter_mut().filter(|s| sel.contains(&s.id)) {
+                    s.cut = None;
+                }
+            }),
+            CutBox => self.dialog = Some(Dialog::CutBox(crate::dialogs::CutBoxDialog { margin: 2.0, radius: 0.0, layer: None })),
             DeleteDuplicates => {
                 self.checkpoint_named(&label);
                 let n = edit::delete_duplicates(&mut self.doc);

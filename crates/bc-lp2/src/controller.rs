@@ -2,6 +2,7 @@
 
 use crate::job::File;
 use crate::protocol::{self, Reader, Status};
+use crate::settings::Settings;
 use std::fmt;
 use std::io;
 use std::time::{Duration, Instant};
@@ -51,6 +52,14 @@ pub trait Port: Send {
 
 struct Serial(Box<dyn serialport::SerialPort>);
 
+impl Drop for Serial {
+    /// Lowers DTR and RTS, which is all the app does to disconnect.
+    fn drop(&mut self) {
+        let _ = self.0.write_data_terminal_ready(false);
+        let _ = self.0.write_request_to_send(false);
+    }
+}
+
 impl Port for Serial {
     fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         io::Write::write_all(&mut self.0, data)?;
@@ -73,12 +82,12 @@ pub struct Controller {
 }
 
 impl Controller {
-    /// Opens the serial port and introduces itself as the LP2's app does.
-    pub fn connect(port: &str) -> Result<Self> {
+    /// Opens the serial port and introduces itself as the LP2's app does, writing `settings`.
+    pub fn connect(port: &str, settings: &Settings) -> Result<Self> {
         let mut serial = serialport::new(port, crate::BAUD).timeout(Duration::from_millis(20)).open().map_err(|e| Error::Io(e.into()))?;
         serial.write_data_terminal_ready(true).map_err(|e| Error::Io(e.into()))?;
         serial.write_request_to_send(true).map_err(|e| Error::Io(e.into()))?;
-        Self::with_port(Box::new(Serial(serial)))
+        Self::with_port(Box::new(Serial(serial)), settings)
     }
 
     /// Whether a LaserPecker 2 answers on `port`. Only asks its firmware version, which changes nothing.
@@ -94,14 +103,19 @@ impl Controller {
         }
     }
 
-    pub fn with_port(port: Box<dyn Port>) -> Result<Self> {
+    pub fn with_port(port: Box<dyn Port>, settings: &Settings) -> Result<Self> {
         let mut c = Self { port, reader: Reader::default(), status: None };
         for (what, name) in [(protocol::QUERY_VERSION, "version"), (protocol::QUERY_08, "hello"), (protocol::QUERY_SERIAL, "serial number"), (protocol::QUERY_SETTINGS, "settings")] {
             c.request(&protocol::query(what), name, REPLY_TIMEOUT, |p| p.is_empty() || p[0] == 0x00)?;
         }
-        c.request(&protocol::CONNECT_SETTINGS, "settings", REPLY_TIMEOUT, |p| p.starts_with(&[0x06, 0x01]))?;
+        c.write_settings(settings)?;
         c.query_status()?;
         Ok(c)
+    }
+
+    /// Writes the machine's settings (beep, touch buttons, work mode and so on).
+    pub fn write_settings(&mut self, settings: &Settings) -> Result<()> {
+        self.request(&settings.command(), "settings", REPLY_TIMEOUT, |p| p.starts_with(&[0x06, 0x01])).map(|_| ())
     }
 
     fn send(&mut self, payload: &[u8]) -> Result<()> {
@@ -153,9 +167,9 @@ impl Controller {
         self.request(&cmd, "preview", REPLY_TIMEOUT, |p| p.starts_with(&[0x02, 0x02])).map(|_| ())
     }
 
-    /// Uploads a job and starts it at `power` and `speed` (percent). `progress` hears bytes sent
-    /// and the total. Afterwards, [`Controller::query_status`] follows the job.
-    pub fn run(&mut self, file: &File, power: u8, speed: u8, mut progress: impl FnMut(usize, usize)) -> Result<()> {
+    /// Uploads a job and starts it at `power` and `speed` (percent), `passes` times over. `progress`
+    /// hears bytes sent and the total. Afterwards, [`Controller::query_status`] follows the job.
+    pub fn run(&mut self, file: &File, power: u8, speed: u8, passes: u16, mut progress: impl FnMut(usize, usize)) -> Result<()> {
         self.query_status()?;
         // The app asks for this block before every upload.
         self.request(&protocol::query(protocol::QUERY_BLOCK), "upload", REPLY_TIMEOUT, |p| p.len() >= 64 && p[0] == 0x00)?;
@@ -186,7 +200,7 @@ impl Controller {
         // Followed by `FF 01` and the size; the app doesn't seem to wait for it.
         let _ = self.wait_for("upload", Duration::from_millis(500), |p| p.starts_with(&[0xFF, 0x01]));
         self.idle()?;
-        self.request(&protocol::start(file.job, power, speed, file.at_mm), "start", REPLY_TIMEOUT, |p| p.starts_with(&[0x01, 0x01]))?;
+        self.request(&protocol::start(file.job, power, speed, file.at_mm, passes), "start", REPLY_TIMEOUT, |p| p.starts_with(&[0x01, 0x01]))?;
         Ok(())
     }
 }
@@ -256,7 +270,7 @@ mod tests {
     #[test]
     fn connects_and_runs_a_job_like_the_app() {
         let lp2 = FakeLp2::default();
-        let mut c = Controller::with_port(Box::new(lp2.clone())).unwrap();
+        let mut c = Controller::with_port(Box::new(lp2.clone()), &Settings::default()).unwrap();
         let firsts: Vec<(u8, u8)> = lp2.commands().iter().map(|p| (p[0], p[1])).collect();
         assert_eq!(firsts, [(0x00, 0x03), (0x00, 0x08), (0x00, 0x05), (0x00, 0x02), (0x06, 0x01), (0x00, 0x00)]);
         assert_eq!(c.status.unwrap().state, crate::State::Idle);
@@ -265,13 +279,13 @@ mod tests {
         let ring = vec![(10.763, 15.576), (48.386, 15.576), (48.386, 42.639), (10.763, 42.639), (10.763, 15.576)];
         let file = gcode_file(&[(ring, 1.0)], 0x547F8A85, "Untitled").unwrap();
         let mut last = (0, 0);
-        c.run(&file, 100, 0x62, |done, total| last = (done, total)).unwrap();
+        c.run(&file, 100, 0x62, 1, |done, total| last = (done, total)).unwrap();
         assert_eq!(last, (0xDA, 0xDA));
         let firsts: Vec<(u8, u8)> = lp2.commands().iter().map(|p| (p[0], p[1])).collect();
         assert_eq!(firsts, [(0x00, 0x00), (0x00, 0x01), (0xFF, 0x00), (0x05, 0x01), (0xFF, 0x00), (0x01, 0x01)]);
         let uploaded: Vec<u8> = lp2.sent.lock().unwrap().iter().filter(|w| !w.starts_with(&protocol::SYNC)).flatten().copied().collect();
         assert_eq!(uploaded, file.bytes);
-        assert_eq!(lp2.commands().last().unwrap(), &protocol::start(0x547F8A85, 100, 0x62, (10, 15)));
+        assert_eq!(lp2.commands().last().unwrap(), &protocol::start(0x547F8A85, 100, 0x62, (10, 15), 1));
     }
 
     #[test]
@@ -286,6 +300,6 @@ mod tests {
                 Ok(0)
             }
         }
-        assert!(matches!(Controller::with_port(Box::new(Silent)), Err(Error::NoReply("version"))));
+        assert!(matches!(Controller::with_port(Box::new(Silent), &Settings::default()), Err(Error::NoReply("version"))));
     }
 }

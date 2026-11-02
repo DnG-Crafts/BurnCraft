@@ -62,6 +62,12 @@ pub enum Icon {
     Dimension,
     Eraser,
     ShapeBuilder,
+    CutStart,
+    SnapGrid,
+    SnapObjects,
+    SmartGuides,
+    CutOrder,
+    BurnPreview,
     Chamfer,
     Lock,
     Unlocked,
@@ -344,6 +350,56 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, ink: Color32, accent: Color
         Icon::Text => {
             line(&[(0.1, 0.95), (0.5, 0.05), (0.9, 0.95)], Stroke::new(w * 1.4, ink));
             line(&[(0.27, 0.6), (0.73, 0.6)], Stroke::new(w * 1.4, ink));
+        }
+        Icon::SnapGrid => {
+            // A grid, with a point snapped onto a crossing (accent).
+            for t in [0.2, 0.5, 0.8] {
+                line(&[(t, 0.05), (t, 0.95)], s);
+                line(&[(0.05, t), (0.95, t)], s);
+            }
+            p.circle_filled(at(0.5, 0.5), r.width() * 0.11, accent);
+        }
+        Icon::SnapObjects => {
+            // A square, with a point snapped onto its corner (accent).
+            rect(0.1, 0.35, 0.65, 0.9, s);
+            p.circle_stroke(at(0.65, 0.35), r.width() * 0.13, a);
+            p.circle_filled(at(0.65, 0.35), r.width() * 0.05, accent);
+        }
+        Icon::SmartGuides => {
+            // Two squares lined up along a guide (accent).
+            rect(0.08, 0.45, 0.4, 0.8, s);
+            rect(0.58, 0.2, 0.92, 0.8, s);
+            for x in [0.0, 0.2, 0.4, 0.6, 0.8] {
+                line(&[(x, 0.8), (x + 0.1, 0.8)], a);
+            }
+            line(&[(0.0, 0.8), (1.0, 0.8)], a);
+        }
+        Icon::CutOrder => {
+            // Numbered stops along a path, run in order (accent arrow).
+            line(&[(0.12, 0.85), (0.42, 0.25), (0.88, 0.6)], s);
+            for (x, y) in [(0.12, 0.85), (0.42, 0.25), (0.88, 0.6)] {
+                p.circle_filled(at(x, y), r.width() * 0.08, accent);
+            }
+            arrow_head((0.68, 0.45), 0.65, a);
+        }
+        Icon::BurnPreview => {
+            // A picture frame, its inside dithered into dots.
+            rect(0.08, 0.12, 0.92, 0.88, s);
+            for (i, y) in [0.28, 0.44, 0.6, 0.74].into_iter().enumerate() {
+                for k in 0..4 {
+                    let x = 0.22 + 0.17 * k as f32 + if i % 2 == 1 { 0.085 } else { 0.0 };
+                    if x < 0.85 && (k + i) % 3 != 2 {
+                        p.circle_filled(at(x, y), r.width() * 0.04, accent);
+                    }
+                }
+            }
+        }
+        Icon::CutStart => {
+            // A square outline, its start marked (accent dot) with an arrow the way it's cut.
+            rect(0.15, 0.3, 0.85, 0.9, s);
+            p.circle_filled(at(0.15, 0.3), r.width() * 0.09, accent);
+            line(&[(0.2, 0.14), (0.62, 0.14)], a);
+            arrow_head((0.68, 0.14), 0.0, a);
         }
         Icon::PositionLaser => {
             arc(0.5, 0.38, 0.28, PI * 0.85, PI * 2.15, s);

@@ -4,7 +4,7 @@
 //! "energy per mm" model, good enough to compare settings and spot problems), drawn at the laser's
 //! line width for cuts and at the line interval for fills and images, then coloured for the material.
 
-use crate::{Job, JobPath};
+use crate::{Job, JobPath, Moment};
 use bc_doc::LayerMode;
 use bc_geom::{Point, Rect};
 
@@ -73,13 +73,11 @@ fn intensity(path: &JobPath, settings: &bc_doc::Layer) -> f32 {
     (1.0 - (-1.6 * energy).exp()).clamp(0.0, 1.0) as f32
 }
 
-/// Renders `job` (its first `progress` fraction of paths) on `material` over `area`.
-pub fn render(job: &Job, area: Rect, px_per_mm: f64, material: Material, progress: f32) -> Picture {
+/// Renders `job` as far as `upto` on `material` over `area`.
+pub fn render(job: &Job, area: Rect, px_per_mm: f64, material: Material, upto: &Moment) -> Picture {
     let width = ((area.width() * px_per_mm).ceil() as usize).max(1);
     let height = ((area.height() * px_per_mm).ceil() as usize).max(1);
     let mut burn = vec![0.0f32; width * height];
-    let total: usize = job.layers.iter().map(|l| l.paths.len()).sum();
-    let limit = (total as f32 * progress.clamp(0.0, 1.0)).round() as usize;
     let mut drawn = 0;
     'layers: for layer in &job.layers {
         let s = &layer.settings;
@@ -87,17 +85,26 @@ pub fn render(job: &Job, area: Rect, px_per_mm: f64, material: Material, progres
         let line_mm = if s.mode == LayerMode::Line { 0.15 } else { s.interval.max(0.05) };
         let radius = (line_mm * px_per_mm / 2.0).max(0.5);
         for path in &layer.paths {
-            if drawn >= limit {
+            // Whole paths that are done, then the part of the next one cut so far.
+            let partial;
+            let points = if drawn < upto.done {
+                &path.points
+            } else if let Some(along) = upto.along {
+                partial = path.partial(along).0;
+                &partial
+            } else {
+                break 'layers;
+            };
+            let i = intensity(path, s);
+            if i > 0.0 {
+                for w in points.windows(2) {
+                    stamp_line(&mut burn, width, height, area, px_per_mm, w[0], w[1], radius, i);
+                }
+            }
+            if drawn >= upto.done {
                 break 'layers;
             }
             drawn += 1;
-            let i = intensity(path, s);
-            if i <= 0.0 {
-                continue;
-            }
-            for w in path.points.windows(2) {
-                stamp_line(&mut burn, width, height, area, px_per_mm, w[0], w[1], radius, i);
-            }
         }
     }
     let (base, burned, grain) = material.colours();
@@ -122,39 +129,52 @@ pub fn render(job: &Job, area: Rect, px_per_mm: f64, material: Material, progres
     Picture { width, height, rgb, area }
 }
 
-/// The Lines view of a job as a picture of `area` at `px_per_mm`: burns in their layer colour
-/// (fainter for lower grayscale power), laser-off runs and travel moves faint when `show_travel`.
-/// Drawing into a picture keeps huge jobs (photos are millions of short runs) as cheap to show as
-/// small ones. Returns the picture and where the head is after the shown part.
-pub fn render_lines(job: &Job, area: Rect, px_per_mm: f64, progress: f32, show_travel: bool) -> (Picture, Point) {
+/// The Lines view of a job, as far as `upto`, as a picture of `area` at `px_per_mm`: burns in
+/// their layer colour (fainter for lower grayscale power), laser-off runs and travel moves faint
+/// when `show_travel`. Drawing into a picture keeps huge jobs (photos are millions of short runs)
+/// as cheap to show as small ones.
+pub fn render_lines(job: &Job, area: Rect, px_per_mm: f64, upto: &Moment, show_travel: bool) -> Picture {
     let width = ((area.width() * px_per_mm).ceil() as usize).max(1);
     let height = ((area.height() * px_per_mm).ceil() as usize).max(1);
     let mut rgb = vec![250u8; width * height * 3];
-    let total: usize = job.layers.iter().map(|l| l.paths.len()).sum();
-    let limit = (total as f32 * progress.clamp(0.0, 1.0)).round() as usize;
     let to_px = |p: Point| ((p.x - area.x0) * px_per_mm, (p.y - area.y0) * px_per_mm);
     let mut pos = Point::ORIGIN;
     let mut drawn = 0;
     'layers: for layer in &job.layers {
         let [r, g, b] = layer.settings.rgb(layer.index);
         for path in &layer.paths {
-            if drawn >= limit {
+            let current = drawn >= upto.done;
+            if current && upto.along.is_none() {
+                // Travelling to this path: the move so far.
+                if show_travel {
+                    draw_line(&mut rgb, width, height, to_px(pos), to_px(upto.head), [120, 120, 255], 0.5);
+                }
                 break 'layers;
             }
-            drawn += 1;
             if show_travel && path.points.first().is_some_and(|p| p.distance(pos) > 1e-9) {
                 draw_line(&mut rgb, width, height, to_px(pos), to_px(path.points[0]), [120, 120, 255], 0.5);
             }
+            let partial;
+            let points = if current {
+                partial = path.partial(upto.along.unwrap_or(0.0)).0;
+                &partial
+            } else {
+                &path.points
+            };
             let alpha = if path.power <= 0.0 { 0.15 } else { (80.0 + 175.0 * path.power) / 255.0 };
             if show_travel || path.power > 0.0 {
-                for w in path.points.windows(2) {
+                for w in points.windows(2) {
                     draw_line(&mut rgb, width, height, to_px(w[0]), to_px(w[1]), [r, g, b], alpha);
                 }
             }
+            if current {
+                break 'layers;
+            }
             pos = path.points.last().copied().unwrap_or(pos);
+            drawn += 1;
         }
     }
-    (Picture { width, height, rgb, area }, pos)
+    Picture { width, height, rgb, area }
 }
 
 /// A 1-pixel line, blended over the picture.
@@ -239,6 +259,21 @@ mod tests {
         [p.rgb[i], p.rgb[i + 1], p.rgb[i + 2]]
     }
 
+    /// The whole job, and none of it.
+    const ALL: Moment = Moment { done: usize::MAX, along: None, head: Point::ORIGIN, layer: None };
+    const NONE: Moment = Moment { done: 0, along: None, head: Point::ORIGIN, layer: None };
+
+    #[test]
+    fn a_path_being_cut_is_drawn_up_to_the_head() {
+        // The line runs from x = 2 to x = 18; halfway along it, x = 14 isn't burnt yet.
+        let area = Rect::new(0.0, 0.0, 20.0, 10.0);
+        let half = Moment { done: 0, along: Some(8.0), head: Point::new(10.0, 5.0), layer: Some(0) };
+        let pic = render(&job(80.0, 20.0), area, 10.0, Material::Plywood, &half);
+        let blank = luma(pixel(&pic, 10.0, 2.0));
+        assert!(luma(pixel(&pic, 6.0, 5.0)) < blank - 60.0, "burnt behind the head");
+        assert!((luma(pixel(&pic, 14.0, 5.0)) - blank).abs() < 30.0, "not yet ahead of it");
+    }
+
     fn luma(c: [u8; 3]) -> f32 {
         0.3 * c[0] as f32 + 0.59 * c[1] as f32 + 0.11 * c[2] as f32
     }
@@ -254,7 +289,8 @@ mod tests {
         }).collect();
         let job = Job { layers: vec![JobLayer { index: 0, settings, paths }], skipped: Vec::new() };
         let start = std::time::Instant::now();
-        let (pic, head) = render_lines(&job, Rect::new(0.0, 0.0, 100.0, 100.0), 6.0, 1.0, true);
+        let end = job.moment(Point::ORIGIN, 100.0, 1.0);
+        let (pic, head) = (render_lines(&job, Rect::new(0.0, 0.0, 100.0, 100.0), 6.0, &end, true), end.head);
         assert_eq!((pic.width, pic.height), (600, 600));
         assert!(start.elapsed().as_secs_f64() < 5.0, "{:?}", start.elapsed());
         assert!((head.x - 99.95).abs() < 1e-6, "head ends at the last run: {head:?}");
@@ -265,20 +301,20 @@ mod tests {
     #[test]
     fn burns_darken_wood_and_lighten_slate() {
         let area = Rect::new(0.0, 0.0, 20.0, 10.0);
-        let wood = render(&job(80.0, 20.0), area, 10.0, Material::Plywood, 1.0);
+        let wood = render(&job(80.0, 20.0), area, 10.0, Material::Plywood, &ALL);
         assert!(luma(pixel(&wood, 10.0, 5.0)) < luma(pixel(&wood, 10.0, 2.0)) - 60.0, "the line is dark on wood");
-        let slate = render(&job(80.0, 20.0), area, 10.0, Material::Slate, 1.0);
+        let slate = render(&job(80.0, 20.0), area, 10.0, Material::Slate, &ALL);
         assert!(luma(pixel(&slate, 10.0, 5.0)) > luma(pixel(&slate, 10.0, 2.0)) + 60.0, "the line is light on slate");
     }
 
     #[test]
     fn more_power_or_slower_speed_burns_darker() {
         let area = Rect::new(0.0, 0.0, 20.0, 10.0);
-        let at = |power, speed| luma(pixel(&render(&job(power, speed), area, 10.0, Material::Plywood, 1.0), 10.0, 5.0));
+        let at = |power, speed| luma(pixel(&render(&job(power, speed), area, 10.0, Material::Plywood, &ALL), 10.0, 5.0));
         assert!(at(80.0, 20.0) < at(20.0, 20.0), "more power is darker");
         assert!(at(30.0, 10.0) < at(30.0, 200.0), "slower is darker");
         // Nothing shows before the job starts.
-        let blank = render(&job(80.0, 20.0), area, 10.0, Material::Plywood, 0.0);
+        let blank = render(&job(80.0, 20.0), area, 10.0, Material::Plywood, &NONE);
         assert!((luma(pixel(&blank, 10.0, 5.0)) - luma(pixel(&blank, 10.0, 5.3))).abs() < 30.0);
     }
 }

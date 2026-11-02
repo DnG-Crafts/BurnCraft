@@ -19,9 +19,9 @@ pub mod shapelib;
 pub mod tiles;
 pub mod warp;
 
-pub use kurbo::{Affine, BezPath, PathEl, Point, Rect, Vec2};
+pub use kurbo::{Affine, BezPath, ParamCurve, PathEl, PathSeg, Point, Rect, Vec2};
 use kurbo::Shape as _;
-use kurbo::{ParamCurve as _, ParamCurveArclen as _};
+use kurbo::ParamCurveArclen as _;
 
 /// Default curve flattening tolerance, in mm.
 pub const TOLERANCE: f64 = 0.01;

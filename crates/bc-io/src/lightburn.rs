@@ -612,7 +612,7 @@ mod tests {
                 println!("  layer {i} {} {:?} {} mm/s {}-{}%", l.name, l.mode, l.speed, l.min_power, l.max_power);
             }
             for s in &p.shapes {
-                let shape = bc_doc::Shape { id: 0, kind: s.kind.clone(), transform: s.transform, layer: s.layer, locked: false, group: None, effects: Vec::new() };
+                let shape = bc_doc::Shape { id: 0, kind: s.kind.clone(), transform: s.transform, layer: s.layer, locked: false, group: None, effects: Vec::new(), cut: None };
                 let b = shape.bounds().unwrap();
                 println!("  {} on {}: x {:.2}..{:.2} y {:.2}..{:.2}", s.kind.type_name(), s.layer, b.x0, b.x1, b.y0, b.y1);
             }

@@ -9,10 +9,12 @@
 pub mod controller;
 pub mod job;
 pub mod protocol;
+pub mod settings;
 
 pub use controller::{Controller, Error, Port};
-pub use job::{File, Kind};
+pub use job::{File, Kind, Resolution};
 pub use protocol::{State, Status};
+pub use settings::{Settings, WorkMode};
 
 /// The baud rate the LP2's app sets on the CH340.
 pub const BAUD: u32 = 460_800;

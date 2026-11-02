@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// File types the art folder shows.
-const ART_EXTENSIONS: [&str; 15] = ["bcproj", "svg", "dxf", "pdf", "ai", "eps", "emf", "wmf", "lbrn2", "lbrn", "png", "jpg", "jpeg", "bmp", "psd"];
+const ART_EXTENSIONS: [&str; 16] = ["bcproj", "svg", "dxf", "pdf", "ai", "eps", "emf", "wmf", "lbrn2", "lbrn", "rld", "png", "jpg", "jpeg", "bmp", "psd"];
 /// Most files listed from a folder (and its subfolders).
 const MAX_FILES: usize = 1000;
 const THUMB: f32 = 76.0;
@@ -203,12 +203,12 @@ fn file_thumb(path: &Path, fonts: &bc_io::fonts::FontLibrary) -> Option<Vec<Vec<
             .filter(|s| !matches!(s.kind, ShapeKind::Image { .. }))
             .map(|s| s.world_path())
             .collect(),
-        "lbrn2" | "lbrn" => bc_io::lightburn::import(&bytes, 1000.0, fonts)
+        "lbrn2" | "lbrn" | "rld" => if ext == "rld" { bc_io::rld::import(&bytes) } else { bc_io::lightburn::import(&bytes, 1000.0, fonts) }
             .ok()?
             .shapes
             .into_iter()
             .filter(|s| !matches!(s.kind, ShapeKind::Image { .. }))
-            .map(|s| bc_doc::Shape { id: 0, kind: s.kind, transform: s.transform, layer: 0, locked: false, group: None, effects: Vec::new() }.world_path())
+            .map(|s| bc_doc::Shape { id: 0, kind: s.kind, transform: s.transform, layer: 0, locked: false, group: None, effects: Vec::new(), cut: None }.world_path())
             .collect(),
         _ => return None,
     };
@@ -300,7 +300,7 @@ impl BurnCraftApp {
                     let shapes = (t.shapes)();
                     let paths: Vec<BezPath> = shapes
                         .iter()
-                        .map(|(kind, tr)| bc_doc::Shape { id: 0, kind: kind.clone(), transform: *tr, layer: 0, locked: false, group: None, effects: Vec::new() }.world_path())
+                        .map(|(kind, tr)| bc_doc::Shape { id: 0, kind: kind.clone(), transform: *tr, layer: 0, locked: false, group: None, effects: Vec::new(), cut: None }.world_path())
                         .collect();
                     if tile(ui, t.name, normalise(&paths).as_ref(), "?").on_hover_text("Click to add it at the centre of the bed").clicked() {
                         self.add_template(i);
@@ -450,7 +450,7 @@ mod tests {
             assert!(!shapes.is_empty(), "{}", t.name);
             let b = shapes
                 .iter()
-                .map(|(k, tr)| bc_doc::Shape { id: 0, kind: k.clone(), transform: *tr, layer: 0, locked: false, group: None, effects: Vec::new() })
+                .map(|(k, tr)| bc_doc::Shape { id: 0, kind: k.clone(), transform: *tr, layer: 0, locked: false, group: None, effects: Vec::new(), cut: None })
                 .filter_map(|s| { assert!(s.is_closed(), "{} has an open shape", t.name); s.bounds() })
                 .reduce(|a, b| a.union(b))
                 .unwrap();

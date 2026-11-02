@@ -44,6 +44,14 @@ pub struct MachineLayer {
     pub raster: bool,
     /// The layer's pass count. `paths` already repeats each pass.
     pub passes: u32,
+    /// Raster line interval (mm), for raster layers.
+    pub interval: f64,
+    /// Z axis (G-code machines): the layer's offset and per-pass step, in mm.
+    pub z_offset: f64,
+    pub z_step: f64,
+    /// G-code: laser held on at the start and end of each burn (ms).
+    pub delay_on: f64,
+    pub delay_off: f64,
     /// Polylines with a power fraction (0 = laser off).
     pub paths: Vec<(Vec<(f64, f64)>, f32)>,
 }
@@ -58,7 +66,9 @@ pub enum DeviceCmd {
     ConnectRuida { target: RuidaTarget, model: RuidaModel },
     ConnectGcode { port: String, baud: u32, dtr: bool, options: Box<GcodeOptions> },
     ConnectGalvo(Box<GalvoSettings>),
-    ConnectLp2 { port: String },
+    ConnectLp2 { port: String, settings: bc_lp2::Settings },
+    /// LaserPecker 2: write the machine's own settings (beep, touch buttons, work mode…).
+    Lp2Settings(bc_lp2::Settings),
     Disconnect,
     Home,
     /// G-code: clear an alarm lock.
@@ -67,6 +77,10 @@ pub enum DeviceCmd {
     JogBy(f64, f64, f64),
     /// Absolute rapid move in machine mm, at `feed` mm/s where supported.
     MoveTo(f64, f64, f64),
+    /// G-code: relative Z move in mm (positive raises the laser), at `feed` mm/s.
+    JogZ(f64, f64),
+    /// Ruida: press (true) or release a keypad direction key; the axis moves while it's held.
+    JogKey(bc_ruida::JogKey, bool),
     /// A raw controller command typed in the console (G-code).
     Console(String),
     /// GRBL: read the controller's own settings (`$$`).
@@ -453,9 +467,9 @@ impl Worker {
                     Err(e) => self.send(DeviceEvent::Disconnected(Some(format!("Could not connect to the galvo: {e}")))),
                 }
             }
-            DeviceCmd::ConnectLp2 { port } => {
+            DeviceCmd::ConnectLp2 { port, settings } => {
                 self.backend = None;
-                match bc_lp2::Controller::connect(&port) {
+                match bc_lp2::Controller::connect(&port, &settings) {
                     Ok(controller) => {
                         let lp2 = Lp2 { controller, queue: VecDeque::new(), files: 0, started: 0, running: None, engraving: false, progress: ShapeProgress::default(), preview_until: None };
                         self.bed = Some(bc_lp2::FIELD);
@@ -467,6 +481,16 @@ impl Worker {
             DeviceCmd::Disconnect => {
                 self.backend = None;
                 self.send(DeviceEvent::Disconnected(None));
+            }
+            DeviceCmd::Lp2Settings(settings) => {
+                let result = match &mut self.backend {
+                    Some(Backend::Lp2(l)) if l.running.is_some() => Err("The LaserPecker's settings can't change during a job; they're sent when it next connects".to_string()),
+                    Some(Backend::Lp2(l)) => l.controller.write_settings(&settings).map_err(|e| format!("Couldn't change the LaserPecker's settings: {e}")),
+                    _ => Ok(()),
+                };
+                if let Err(e) = result {
+                    self.send(DeviceEvent::Error(e));
+                }
             }
             other => {
                 if matches!(other, DeviceCmd::MoveTo(..) | DeviceCmd::JogBy(..) | DeviceCmd::Frame(..)) {
@@ -506,6 +530,8 @@ fn ruida_command(c: &Controller, cmd: DeviceCmd, tx: &Sender<DeviceEvent>, ctx: 
     let r = match cmd {
         DeviceCmd::Home => c.home(),
         DeviceCmd::Unlock => return Ok(None),
+        DeviceCmd::JogKey(key, pressed) => c.jog_key(key, pressed),
+        DeviceCmd::JogZ(..) => return Err("Hold the Z buttons to move a Ruida's Z axis".into()),
         DeviceCmd::JogBy(dx, dy, speed) => c.state().and_then(|s| {
             let (x, y) = clamp_to_bed(bed, (s.x + dx, s.y + dy));
             c.move_to(x, y, speed)
@@ -534,7 +560,7 @@ fn ruida_command(c: &Controller, cmd: DeviceCmd, tx: &Sender<DeviceEvent>, ctx: 
                 .map(|()| Some(DeviceEvent::JobStarted))
                 .map_err(|e| e.to_string());
         }
-        DeviceCmd::ConnectRuida { .. } | DeviceCmd::ConnectGcode { .. } | DeviceCmd::ConnectGalvo(_) | DeviceCmd::ConnectLp2 { .. } | DeviceCmd::Disconnect => unreachable!("handled by the worker"),
+        DeviceCmd::ConnectRuida { .. } | DeviceCmd::ConnectGcode { .. } | DeviceCmd::ConnectGalvo(_) | DeviceCmd::ConnectLp2 { .. } | DeviceCmd::Lp2Settings(_) | DeviceCmd::Disconnect => unreachable!("handled by the worker"),
     };
     r.map(|()| None).map_err(|e| e.to_string())
 }
@@ -547,6 +573,8 @@ fn gcode_command(g: &mut Grbl, options: &GcodeOptions, cmd: DeviceCmd) -> Result
         DeviceCmd::Home => g.home(),
         DeviceCmd::Unlock => g.unlock(),
         DeviceCmd::JogBy(dx, dy, feed) => g.jog_by(dx, dy, feed * 60.0),
+        DeviceCmd::JogZ(dz, feed) => g.jog_z(dz, feed * 60.0),
+        DeviceCmd::JogKey(..) => return Ok(None),
         DeviceCmd::MoveTo(x, y, feed) => g.jog_to(x, y, feed * 60.0),
         DeviceCmd::Console(line) => {
             let mut out = vec![format!("> {line}")];
@@ -584,7 +612,7 @@ fn gcode_command(g: &mut Grbl, options: &GcodeOptions, cmd: DeviceCmd) -> Result
             g.start_stream(bc_grbl::generate(&to_gcode_layers(layers), options));
             return Ok(Some(DeviceEvent::JobStarted));
         }
-        DeviceCmd::ConnectRuida { .. } | DeviceCmd::ConnectGcode { .. } | DeviceCmd::ConnectGalvo(_) | DeviceCmd::ConnectLp2 { .. } | DeviceCmd::Disconnect => unreachable!("handled by the worker"),
+        DeviceCmd::ConnectRuida { .. } | DeviceCmd::ConnectGcode { .. } | DeviceCmd::ConnectGalvo(_) | DeviceCmd::ConnectLp2 { .. } | DeviceCmd::Lp2Settings(_) | DeviceCmd::Disconnect => unreachable!("handled by the worker"),
     };
     r.map(|()| None).map_err(|e| e.to_string())
 }
@@ -599,6 +627,7 @@ fn galvo_command(g: &mut Galvo, cmd: DeviceCmd, tx: &Sender<DeviceEvent>, ctx: &
             c.goto(g.at)
         }
         DeviceCmd::Unlock => return Ok(None),
+        DeviceCmd::JogZ(..) | DeviceCmd::JogKey(..) => return Err("This machine has no Z or U axis to move".into()),
         DeviceCmd::JogBy(dx, dy, _) => {
             g.at = (g.at.0 + dx, g.at.1 + dy);
             c.goto(g.at)
@@ -639,7 +668,7 @@ fn galvo_command(g: &mut Galvo, cmd: DeviceCmd, tx: &Sender<DeviceEvent>, ctx: &
             }
             return Ok(Some(DeviceEvent::JobStarted));
         }
-        DeviceCmd::ConnectRuida { .. } | DeviceCmd::ConnectGcode { .. } | DeviceCmd::ConnectGalvo(_) | DeviceCmd::ConnectLp2 { .. } | DeviceCmd::Disconnect => unreachable!("handled by the worker"),
+        DeviceCmd::ConnectRuida { .. } | DeviceCmd::ConnectGcode { .. } | DeviceCmd::ConnectGalvo(_) | DeviceCmd::ConnectLp2 { .. } | DeviceCmd::Lp2Settings(_) | DeviceCmd::Disconnect => unreachable!("handled by the worker"),
     };
     r.map(|()| None).map_err(|e| e.to_string())
 }
@@ -651,6 +680,7 @@ struct Lp2File {
     file: bc_lp2::File,
     power: u8,
     speed: u8,
+    passes: u16,
     shapes: Vec<f64>,
 }
 
@@ -689,7 +719,7 @@ impl ShapeProgress {
 }
 
 /// The LaserPecker 2's files for a job: a G-code file per line layer, and a bitmap per engraving
-/// layer, once for each pass.
+/// layer at the resolution nearest its line interval.
 fn lp2_files(layers: &[MachineLayer]) -> Result<VecDeque<Lp2File>, String> {
     let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u32).unwrap_or(1);
     let mut files = VecDeque::new();
@@ -697,14 +727,26 @@ fn lp2_files(layers: &[MachineLayer]) -> Result<VecDeque<Lp2File>, String> {
         // A fresh id for each file, as the app uses.
         let job = seed.wrapping_mul(2_654_435_761).wrapping_add(i as u32 * 7919) | 1;
         let (power, speed) = (bc_lp2::power_percent(l.max_power), bc_lp2::speed_percent(l.speed));
-        if l.raster {
-            let file = bc_lp2::job::image_file(&l.paths, job, "BurnCraft")?;
-            files.extend(std::iter::repeat_n(Lp2File { file, power, speed, shapes: Vec::new() }, l.passes.max(1) as usize));
+        // The machine runs the passes itself: send one pass of the paths (the job repeats them).
+        let passes = l.passes.clamp(1, u16::MAX as u32) as usize;
+        let n = l.paths.len() / passes;
+        let repeated = passes > 1 && n > 0 && l.paths.len() % passes == 0 && l.paths.chunks(n).all(|c| c == &l.paths[..n]);
+        let one_pass = if repeated { &l.paths[..n] } else { &l.paths[..] };
+        let passes = if one_pass.len() < l.paths.len() { passes } else { 1 };
+        // Progress starts again for each shape, and is assumed to for each pass.
+        let shapes: Vec<f64> = if l.raster {
+            vec![1.0; passes]
         } else {
             // The same paths, in the same order, as the G-code file burns.
-            let shapes = l.paths.iter().filter(|(p, power)| *power > 0.0 && p.len() >= 2).map(|(p, _)| p.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).sum()).collect();
-            files.push_back(Lp2File { file: bc_lp2::job::gcode_file(&l.paths, job, "BurnCraft")?, power, speed, shapes });
-        }
+            let lengths: Vec<f64> = one_pass.iter().filter(|(p, power)| *power > 0.0 && p.len() >= 2).map(|(p, _)| p.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).sum()).collect();
+            lengths.repeat(passes)
+        };
+        let file = if l.raster {
+            bc_lp2::job::image_file(one_pass, job, "BurnCraft", bc_lp2::Resolution::for_interval(l.interval))?
+        } else {
+            bc_lp2::job::gcode_file(one_pass, job, "BurnCraft")?
+        };
+        files.push_back(Lp2File { file, power, speed, passes: passes as u16, shapes });
     }
     if files.is_empty() {
         return Err("Nothing to engrave".into());
@@ -714,11 +756,11 @@ fn lp2_files(layers: &[MachineLayer]) -> Result<VecDeque<Lp2File>, String> {
 
 /// Uploads and starts the next file in the queue.
 fn lp2_next(l: &mut Lp2, tx: &Sender<DeviceEvent>, ctx: &egui::Context) -> Result<(), String> {
-    let Some(Lp2File { file, power, speed, shapes }) = l.queue.pop_front() else { return Ok(()) };
+    let Some(Lp2File { file, power, speed, passes, shapes }) = l.queue.pop_front() else { return Ok(()) };
     l.started += 1;
     let what = if l.files > 1 { "Sending part" } else { "Sending" };
     l.controller
-        .run(&file, power, speed, |sent, total| {
+        .run(&file, power, speed, passes, |sent, total| {
             let _ = tx.send(DeviceEvent::Progress(sent, total, what));
             ctx.request_repaint();
         })
@@ -773,7 +815,7 @@ fn lp2_command(l: &mut Lp2, cmd: DeviceCmd, tx: &Sender<DeviceEvent>, ctx: &egui
         return Err("A job is running; stop it first".into());
     }
     let r = match cmd {
-        DeviceCmd::Home | DeviceCmd::JogBy(..) | DeviceCmd::MoveTo(..) => return Err("The LaserPecker 2 has no head to move. Use Frame to see where the job will go.".into()),
+        DeviceCmd::Home | DeviceCmd::JogBy(..) | DeviceCmd::MoveTo(..) | DeviceCmd::JogZ(..) | DeviceCmd::JogKey(..) => return Err("The LaserPecker 2 has no head to move. Use Frame to see where the job will go.".into()),
         DeviceCmd::Unlock => return Ok(None),
         DeviceCmd::Console(_) => return Ok(Some(DeviceEvent::Console(vec!["The console is only available for G-code controllers.".into()]))),
         DeviceCmd::ReadSettings | DeviceCmd::WriteSettings(_) => return Err("Machine settings can only be read from GRBL controllers".into()),
@@ -801,7 +843,7 @@ fn lp2_command(l: &mut Lp2, cmd: DeviceCmd, tx: &Sender<DeviceEvent>, ctx: &egui
             lp2_next(l, tx, ctx)?;
             return Ok(Some(DeviceEvent::JobStarted));
         }
-        DeviceCmd::ConnectRuida { .. } | DeviceCmd::ConnectGcode { .. } | DeviceCmd::ConnectGalvo(_) | DeviceCmd::ConnectLp2 { .. } | DeviceCmd::Disconnect => unreachable!("handled by the worker"),
+        DeviceCmd::ConnectRuida { .. } | DeviceCmd::ConnectGcode { .. } | DeviceCmd::ConnectGalvo(_) | DeviceCmd::ConnectLp2 { .. } | DeviceCmd::Lp2Settings(_) | DeviceCmd::Disconnect => unreachable!("handled by the worker"),
     };
     r.map(|()| None)
 }
@@ -815,6 +857,11 @@ pub fn to_gcode_layers(layers: Vec<MachineLayer>) -> Vec<GrblLayer> {
             min_power: l.min_power,
             max_power: l.max_power,
             air_assist: l.air_assist,
+            passes: l.passes,
+            z_offset: l.z_offset,
+            z_step: l.z_step,
+            delay_on: l.delay_on,
+            delay_off: l.delay_off,
             paths: l.paths.into_iter().map(|(points, power)| GrblPath { points, power }).collect(),
         })
         .collect()
@@ -835,6 +882,30 @@ fn to_ruida(l: &MachineLayer) -> RdLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layer(raster: bool, passes: u32, interval: f64) -> MachineLayer {
+        let ring = vec![(10.0, 10.0), (20.0, 10.0), (20.0, 15.0), (10.0, 10.0)];
+        let line = vec![(10.0, 12.0), (20.0, 12.0)];
+        let one: Vec<(Vec<(f64, f64)>, f32)> = vec![(ring, 1.0), (line, 1.0)];
+        MachineLayer { speed: 300.0, min_power: 0.0, max_power: 50.0, air_assist: false, frequency: 30.0, color: [0; 3], raster, passes, interval, z_offset: 0.0, z_step: 0.0, delay_on: 0.0, delay_off: 0.0, paths: (0..passes).flat_map(|_| one.clone()).collect() }
+    }
+
+    #[test]
+    fn lp2_jobs_leave_the_passes_and_resolution_to_the_machine() {
+        let files = lp2_files(&[layer(false, 2, 0.1), layer(true, 3, 0.05)]).unwrap();
+        assert_eq!(files.len(), 2);
+        let (lines, image) = (&files[0], &files[1]);
+        assert_eq!(lines.passes, 2);
+        let gcode = String::from_utf8_lossy(&lines.file.bytes[64..]).to_string();
+        assert_eq!(gcode.matches("M03").count(), 2, "one pass of the two shapes: {gcode}");
+        assert_eq!(lines.shapes.len(), 4, "progress follows both shapes, twice");
+        assert_eq!(image.passes, 3);
+        assert_eq!(image.file.bytes[9], 0x02, "0.05 mm lines go out at 2K");
+        // Paths that don't simply repeat are sent as they are, once.
+        let mut odd = layer(false, 2, 0.1);
+        odd.paths.pop();
+        assert_eq!(lp2_files(&[odd]).unwrap()[0].passes, 1);
+    }
 
     #[test]
     fn lp2_progress_runs_through_the_shapes() {

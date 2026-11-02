@@ -102,6 +102,37 @@ impl JobPath {
     pub fn length(&self) -> f64 {
         self.points.windows(2).map(|w| w[0].distance(w[1])).sum()
     }
+
+    /// The first `along` mm of the path, and where it ends.
+    pub fn partial(&self, along: f64) -> (Vec<Point>, Point) {
+        let mut out = vec![self.points[0]];
+        let mut left = along.max(0.0);
+        for w in self.points.windows(2) {
+            let d = w[0].distance(w[1]);
+            if d >= left {
+                let end = if d > 0.0 { w[0].lerp(w[1], left / d) } else { w[1] };
+                out.push(end);
+                return (out, end);
+            }
+            left -= d;
+            out.push(w[1]);
+        }
+        let end = *self.points.last().expect("paths have points");
+        (out, end)
+    }
+}
+
+/// Where a job is at some moment of its run (see [`Job::moment`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Moment {
+    /// Paths finished, counting through the layers in order.
+    pub done: usize,
+    /// How far (mm) along the next path the head has got, or None while it travels to its start.
+    pub along: Option<f64>,
+    /// Where the head is (design mm).
+    pub head: Point,
+    /// The layer being worked on (an index into the job's layers), until the job ends.
+    pub layer: Option<usize>,
 }
 
 /// One output layer: its settings and ordered paths (design mm). Closed paths end at their first point.
@@ -240,6 +271,42 @@ impl Job {
         })
     }
 
+    /// Where the job is `fraction` of the way through its running time (the same rough timing as
+    /// [`Job::stats`]), starting from `start`.
+    pub fn moment(&self, start: Point, rapid_speed: f64, fraction: f64) -> Moment {
+        if fraction >= 1.0 {
+            let paths = self.layers.iter().flat_map(|l| &l.paths);
+            let head = paths.clone().last().and_then(|p| p.points.last().copied()).unwrap_or(start);
+            return Moment { done: paths.count(), along: None, head, layer: None };
+        }
+        let total = self.stats(start, rapid_speed).seconds;
+        let mut left = fraction.clamp(0.0, 1.0) * total;
+        let rapid = rapid_speed.max(1.0);
+        let mut pos = start;
+        let mut done = 0;
+        for (li, layer) in self.layers.iter().enumerate() {
+            let speed = layer.settings.speed.max(0.1);
+            for path in &layer.paths {
+                let first = path.points[0];
+                let travel = pos.distance(first) / rapid;
+                if left < travel {
+                    let head = pos.lerp(first, left / travel);
+                    return Moment { done, along: None, head, layer: Some(li) };
+                }
+                left -= travel;
+                let cut = path.length() / speed;
+                if left < cut {
+                    let along = left * speed;
+                    return Moment { done, along: Some(along), head: path.partial(along).1, layer: Some(li) };
+                }
+                left -= cut;
+                pos = *path.points.last().expect("paths have points");
+                done += 1;
+            }
+        }
+        Moment { done, along: None, head: pos, layer: None }
+    }
+
     /// Path lengths and a rough duration, starting from `start` (design mm).
     pub fn stats(&self, start: Point, rapid_speed: f64) -> JobStats {
         let mut s = JobStats::default();
@@ -259,6 +326,23 @@ impl Job {
         s.seconds += s.travel_mm / rapid_speed.max(1.0);
         s
     }
+}
+
+/// The design's cutting lines (Line and Fill + Line layers with Output on) in the order the job
+/// cuts them, each starting where and running the way it will be cut: one pass of each layer.
+pub fn cut_order(doc: &Document) -> Vec<Vec<Point>> {
+    let mut out = Vec::new();
+    for (index, settings) in doc.layers.iter().enumerate() {
+        if bc_doc::is_tool_layer(index) || !settings.output || !matches!(settings.mode, LayerMode::Line | LayerMode::FillThenLine) {
+            continue;
+        }
+        let vectors: Vec<&Shape> = doc.shapes.iter().filter(|s| s.layer == index && !matches!(s.kind, ShapeKind::Image { .. })).collect();
+        if vectors.is_empty() {
+            continue;
+        }
+        out.extend(line::line_paths(&vectors, settings).into_iter().filter(|p| !p.is_off() && p.points.len() >= 2).map(|p| p.points));
+    }
+    out
 }
 
 /// Builds the job. With `only` set, just those shapes are output ("cut selected").
@@ -355,6 +439,72 @@ mod tests {
         let xs = || paths[0].points.iter().map(|p| p.x);
         let first_w = xs().fold(f64::MIN, f64::max) - xs().fold(f64::MAX, f64::min);
         assert!((first_w - 10.0).abs() < 1e-6, "the small inner square comes first");
+    }
+
+    #[test]
+    fn cut_order_follows_the_layers_and_skips_fills() {
+        let mut doc = Document::default();
+        let sq = |doc: &mut Document, x: f64, layer| doc.add_shape(ShapeKind::Rect { width: 10.0, height: 10.0, corner_radius: 0.0 }, bc_geom::Affine::translate((x, 20.0)), layer);
+        sq(&mut doc, 100.0, 1);
+        sq(&mut doc, 20.0, 0);
+        sq(&mut doc, 60.0, 0);
+        doc.layers[2].mode = LayerMode::Fill;
+        sq(&mut doc, 200.0, 2);
+        doc.layers[3].output = false;
+        sq(&mut doc, 300.0, 3);
+        let order = cut_order(&doc);
+        let starts: Vec<f64> = order.iter().map(|p| (p[0].x / 10.0).round() * 10.0).collect();
+        // Layer 01 first (nearest the origin first), then layer 02; the fill and the layer with
+        // Output off aren't cut lines.
+        assert_eq!(starts, [20.0, 60.0, 100.0]);
+        assert!(order.iter().all(|p| p.first() == p.last()), "closed cuts end where they start");
+    }
+
+    #[test]
+    fn cut_start_and_direction_set_by_hand() {
+        // A 20 × 10 rectangle centred at (50, 50): corners (40, 45) to (60, 55).
+        let mut doc = Document::default();
+        let id = doc.add_shape(ShapeKind::Rect { width: 20.0, height: 10.0, corner_radius: 0.0 }, bc_geom::Affine::translate((50.0, 50.0)), 0);
+        let automatic = cut_order(&doc);
+        assert_eq!(automatic[0][0], Point::new(40.0, 45.0), "nearest corner to the origin");
+        // Start in the middle of the right edge (local (10, 0)).
+        doc.shape_mut(id).unwrap().cut = Some(bc_doc::CutStart { point: Some(Point::new(10.0, 0.0)), reverse: false });
+        let set = cut_order(&doc);
+        assert_eq!(set[0][0], Point::new(60.0, 50.0));
+        assert_eq!(set[0].last(), Some(&Point::new(60.0, 50.0)), "still closed");
+        let forward = set[0][1];
+        doc.shape_mut(id).unwrap().cut = Some(bc_doc::CutStart { point: Some(Point::new(10.0, 0.0)), reverse: true });
+        let back = cut_order(&doc)[0][1];
+        assert_eq!(cut_order(&doc)[0][0], Point::new(60.0, 50.0));
+        assert!((forward.y - 50.0) * (back.y - 50.0) < 0.0, "reversed runs the other way: {forward:?} {back:?}");
+        // Moving the shape takes the start with it.
+        doc.shape_mut(id).unwrap().transform = bc_geom::Affine::translate((150.0, 50.0));
+        assert_eq!(cut_order(&doc)[0][0], Point::new(160.0, 50.0));
+        // An open line starts from the end nearest the chosen point.
+        let mut doc = Document::default();
+        let line = doc.add_shape(ShapeKind::Path(bc_geom::polyline_path(&[Point::new(0.0, 0.0), Point::new(10.0, 0.0)], false)), bc_geom::Affine::IDENTITY, 0);
+        doc.shape_mut(line).unwrap().cut = Some(bc_doc::CutStart { point: Some(Point::new(9.0, 1.0)), reverse: false });
+        assert_eq!(cut_order(&doc)[0][0], Point::new(10.0, 0.0));
+    }
+
+    #[test]
+    fn moments_follow_the_job_in_time() {
+        // From the origin: 30 mm of travel at 100 mm/s (0.3 s), then a 40 mm line at 20 mm/s (2 s).
+        let mut settings = Layer::new(0);
+        settings.speed = 20.0;
+        let line = JobPath::burn(vec![Point::new(30.0, 0.0), Point::new(70.0, 0.0)]);
+        let job = Job { layers: vec![JobLayer { index: 0, settings, paths: vec![line] }], skipped: Vec::new() };
+        let total = job.stats(Point::ORIGIN, 100.0).seconds;
+        assert!((total - 2.3).abs() < 1e-9);
+        let at = |seconds: f64| job.moment(Point::ORIGIN, 100.0, seconds / total);
+        let m = at(0.15);
+        assert_eq!((m.done, m.along, m.layer), (0, None, Some(0)), "still travelling");
+        assert!((m.head.x - 15.0).abs() < 1e-9);
+        let m = at(1.3);
+        assert!(m.along.is_some_and(|a| (a - 20.0).abs() < 1e-9), "halfway along the line: {m:?}");
+        assert!((m.head.x - 50.0).abs() < 1e-9);
+        let m = at(2.3);
+        assert_eq!((m.done, m.layer, m.head), (1, None, Point::new(70.0, 0.0)), "finished");
     }
 
     #[test]
@@ -471,7 +621,7 @@ mod tests {
         let job = build_all(&doc);
         let area = bc_geom::Rect::new(5.0, 3.0, 80.0, 37.0);
         let mats = [render::Material::Plywood, render::Material::Slate, render::Material::BlackAnodised];
-        let pics: Vec<_> = mats.iter().map(|m| render::render(&job, area, 8.0, *m, 1.0)).collect();
+        let pics: Vec<_> = mats.iter().map(|m| render::render(&job, area, 8.0, *m, &job.moment(Point::ORIGIN, 100.0, 1.0))).collect();
         let (w, h) = (pics[0].width as u32, pics[0].height as u32);
         let mut out = image::RgbImage::new(w, h * 3);
         for (k, p) in pics.iter().enumerate() {
@@ -503,7 +653,7 @@ mod tests {
         let stats = job.stats(Point::ORIGIN, 300.0);
         let st = t.elapsed();
         let t = std::time::Instant::now();
-        let _ = render::render_lines(&job, bc_geom::Rect::new(0.0, 0.0, 600.0, 400.0), 2.0, 1.0, true);
+        let _ = render::render_lines(&job, bc_geom::Rect::new(0.0, 0.0, 600.0, 400.0), 2.0, &job.moment(Point::ORIGIN, 100.0, 1.0), true);
         let lines = t.elapsed();
         println!("TIMING {paths} runs: build {build:?}, stats {st:?}, lines view {lines:?}, est {:.0} s", stats.seconds);
     }
