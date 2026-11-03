@@ -54,26 +54,69 @@ pub fn begin_file(size: u32) -> Vec<u8> {
     p
 }
 
-/// Traces a rectangle with the low-power light until [`idle`] is sent. Sizes are in 0.1 mm.
-pub fn preview(w: u16, h: u16, x: u16, y: u16) -> Vec<u8> {
-    let mut p = vec![0x02, 0x02];
+/// An object's diameter (mm) as sent: hundredths of a mm (used with the roller).
+fn diameter(mm: f64) -> [u8; 2] {
+    ((mm.max(0.0) * 100.0).floor().min(u16::MAX as f64) as u16).to_be_bytes()
+}
+
+/// How the preview light shows a rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewKind {
+    /// Traced on a flat surface.
+    Rectangle = 2,
+    /// With the electric roller, held still (the app's roller preview).
+    Roller = 4,
+    /// With the electric roller turning, to show the whole length.
+    Rolling = 5,
+}
+
+/// Traces a rectangle with the preview light until [`idle`] is sent. Sizes are in 0.1 mm;
+/// `power` is the light's power, `object_mm` the object's diameter (for the roller).
+pub fn preview(kind: PreviewKind, w: u16, h: u16, x: u16, y: u16, power: u8, object_mm: f64) -> Vec<u8> {
+    let mut p = vec![0x02, kind as u8];
     for v in [w, h, x, y] {
         p.extend_from_slice(&v.to_be_bytes());
     }
-    p.extend_from_slice(&[0x00, 0x04, 0x01, 0x07, 0xD0]);
+    // Custom (0), then the pixel size code (4 = 0.1 mm).
+    p.extend_from_slice(&[0x00, 0x04, power.max(1)]);
+    p.extend_from_slice(&diameter(object_mm));
     p
 }
 
+/// What the start command asks for: start a job, or act on the one running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    Start = 1,
+    Continue = 2,
+    End = 3,
+    Hold = 4,
+}
+
 /// Starts the uploaded job: power and speed in percent, the job's id (as in its file header), its
-/// top-left corner in whole mm, and how many passes to run. The machine echoes `01 01`.
-pub fn start(job: u32, power: u8, speed: u8, at_mm: (u16, u16), passes: u16) -> Vec<u8> {
-    let mut p = vec![0x01, 0x01, power, speed];
+/// top-left corner in whole mm, how many passes to run, and the object's diameter (mm, used with
+/// the roller). The machine echoes `01 01`.
+pub fn start(job: u32, power: u8, speed: u8, at_mm: (u16, u16), passes: u16, object_mm: f64) -> Vec<u8> {
+    let mut p = vec![0x01, JobState::Start as u8, power, speed];
     p.extend_from_slice(&job.to_be_bytes());
     p.extend_from_slice(&at_mm.0.to_be_bytes());
     p.extend_from_slice(&at_mm.1.to_be_bytes());
-    p.extend_from_slice(&passes.max(1).to_be_bytes());
-    // Always the same in the captures.
-    p.extend_from_slice(&[0x00, 0x07, 0xD0, 0x01, 0x00, 0x3C, 0x00, 0x00, 0x01]);
+    // Custom (0), then the passes.
+    p.extend_from_slice(&[0x00, passes.clamp(1, 255) as u8]);
+    // Laser type 0 (the LP2's 450 nm diode), then the object's diameter.
+    p.push(0x00);
+    p.extend_from_slice(&diameter(object_mm));
+    // Precision (1), fan (0), laser frequency (60 kHz), speed in mm/s (0: set by the speed
+    // percentage), and where the file is kept (1: the machine's SD card).
+    p.extend_from_slice(&[0x01, 0x00, 0x3C, 0x00, 0x00, 0x01]);
+    p
+}
+
+/// Pauses (Hold), resumes (Continue) or ends the running job: the start command with only its
+/// state set, as the LP2 app sends it.
+pub fn job_state(state: JobState) -> Vec<u8> {
+    let mut p = vec![0x01, state as u8, 0x00, 101];
+    p.resize(22, 0);
+    p.push(0x01);
     p
 }
 
@@ -136,6 +179,14 @@ pub struct Status {
     pub power: u8,
     pub speed: u8,
     pub job: u32,
+    /// What the job is doing (3 once a pass has finished, in the captures).
+    pub work_state: u8,
+    /// The error byte: the LP2 app treats only 3 as an error (the laser's temperature alarm).
+    pub error: u8,
+    /// The electric roller is plugged in.
+    pub roller_connected: bool,
+    /// The pass being run (1, 2…; 0 when none is).
+    pub pass: u8,
 }
 
 impl Status {
@@ -150,7 +201,17 @@ impl Status {
             0x06 => State::Idle,
             s => State::Other(s),
         };
-        Some(Self { state, progress: p[3], power: p[4], speed: p[5], job: u32::from_be_bytes([p[8], p[9], p[10], p[11]]) })
+        Some(Self {
+            state,
+            progress: p[3],
+            power: p[4],
+            speed: p[5],
+            job: u32::from_be_bytes([p[8], p[9], p[10], p[11]]),
+            work_state: p[2],
+            error: p[6],
+            roller_connected: p[14] != 0,
+            pass: p[15],
+        })
     }
 }
 
@@ -168,10 +229,13 @@ mod tests {
         assert_eq!(frame(&idle()), hex("aa bb 08 ff 00 00 00 00 00 00 ff"));
         assert_eq!(frame(&begin_file(0xDA)), hex("aa bb 09 05 01 00 00 00 da 00 00 e0"));
         assert_eq!(frame(&begin_file(0x4901)), hex("aa bb 09 05 01 00 00 49 01 00 00 50"));
-        assert_eq!(frame(&preview(0x178, 0x10E, 0x6B, 0x91)), hex("aa bb 11 02 02 01 78 01 0e 00 6b 00 91 00 04 01 07 d0 02 64"));
-        assert_eq!(frame(&start(0x547F8A85, 100, 0x62, (10, 15), 1)), hex("aa bb 19 01 01 64 62 54 7f 8a 85 00 0a 00 0f 00 01 00 07 d0 01 00 3c 00 00 01 03 d9"));
-        assert_eq!(start(0x02675D3F, 100, 0x62, (42, 42), 2), hex("01 01 64 62 02 67 5d 3f 00 2a 00 2a 00 02 00 07 d0 01 00 3c 00 00 01"), "two passes");
-        assert_eq!(frame(&start(0xA756D19E, 100, 0x47, (45, 44), 1)), hex("aa bb 19 01 01 64 47 a7 56 d1 9e 00 2d 00 2c 00 01 00 07 d0 01 00 3c 00 00 01 04 88"));
+        assert_eq!(frame(&preview(PreviewKind::Rectangle, 0x178, 0x10E, 0x6B, 0x91, 1, 20.0)), hex("aa bb 11 02 02 01 78 01 0e 00 6b 00 91 00 04 01 07 d0 02 64"));
+        assert_eq!(preview(PreviewKind::Roller, 1, 1, 0, 0, 1, 20.0)[1], 4, "the roller preview, held still");
+        assert_eq!(frame(&start(0x547F8A85, 100, 0x62, (10, 15), 1, 20.0)), hex("aa bb 19 01 01 64 62 54 7f 8a 85 00 0a 00 0f 00 01 00 07 d0 01 00 3c 00 00 01 03 d9"));
+        assert_eq!(start(0x02675D3F, 100, 0x62, (42, 42), 2, 20.0), hex("01 01 64 62 02 67 5d 3f 00 2a 00 2a 00 02 00 07 d0 01 00 3c 00 00 01"), "two passes");
+        assert_eq!(job_state(JobState::Hold).len(), start(1, 1, 1, (0, 0), 1, 0.0).len(), "the same command, only its state set");
+        assert_eq!(&job_state(JobState::Hold)[..4], &[0x01, 0x04, 0x00, 101]);
+        assert_eq!(frame(&start(0xA756D19E, 100, 0x47, (45, 44), 1, 20.0)), hex("aa bb 19 01 01 64 47 a7 56 d1 9e 00 2d 00 2c 00 01 00 07 d0 01 00 3c 00 00 01 04 88"));
     }
 
     #[test]
@@ -182,7 +246,7 @@ mod tests {
         assert_eq!(r.next_frame(), None);
         r.push(&hex("03 21 aa bb 08 05 02 01 00 00 00 00 08 aa bb 08 ff 01 00 00 49 01 01 4a"));
         let s = Status::parse(&r.next_frame().unwrap()).unwrap();
-        assert_eq!(s, Status { state: State::Engraving, progress: 4, power: 100, speed: 0x47, job: 0xA756D19E });
+        assert_eq!(s, Status { state: State::Engraving, progress: 4, power: 100, speed: 0x47, job: 0xA756D19E, work_state: 1, error: 0, roller_connected: false, pass: 1 });
         assert_eq!(r.next_frame().unwrap(), hex("05 02 01 00 00 00"));
         assert_eq!(r.next_frame().unwrap(), hex("ff 01 00 00 49 01"));
         assert_eq!(r.next_frame(), None);

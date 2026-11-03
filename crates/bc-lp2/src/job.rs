@@ -151,13 +151,16 @@ pub fn gcode_file(paths: &Paths, job: u32, name: &str) -> Result<File, String> {
     g += "M05\n";
     let size = (units_up(max.0 - min.0, PER_MM)?, units_up(max.1 - min.1, PER_MM)?);
     let corner = (units_down(min.0, PER_MM)?, units_down(min.1, PER_MM)?);
-    let mut bytes = header(0x20, size, job, &[0x00, 0x00, 0x00, 0x0F], corner, 254, name);
+    // The header counts the G-code (one more than its lines: 15 for the app's 14-line rectangle).
+    let count = g.matches('\n').count() as u32 + 1;
+    let mut bytes = header(0x20, size, job, &count.to_be_bytes(), corner, 254, name);
     bytes.extend_from_slice(g.as_bytes());
     Ok(File { kind: Kind::Gcode, job, bytes, at_mm: corner_mm(min) })
 }
 
 /// Engraving as a bitmap: the burning paths (raster scan lines) are drawn onto pixels at `res`.
-pub fn image_file(paths: &Paths, job: u32, name: &str, res: Resolution) -> Result<File, String> {
+/// `roller` marks the file for the electric roller, as the LP2 app does (header byte 21).
+pub fn image_file(paths: &Paths, job: u32, name: &str, res: Resolution, roller: bool) -> Result<File, String> {
     let (on, min, max) = burning(paths)?;
     let per_mm = res.pixels_per_mm();
     let (x0, y0) = (units_down(min.0, per_mm)?, units_down(min.1, per_mm)?);
@@ -185,18 +188,21 @@ pub fn image_file(paths: &Paths, job: u32, name: &str, res: Resolution) -> Resul
         }
     }
     let mut bytes = header(0x10, (w as u16, h as u16), job, &[res.code()], (x0, y0), res.dpi(), name);
+    // The work mode: 0 flat, 1 the electric roller.
+    bytes[21] = u8::from(roller);
     bytes.extend_from_slice(&pixels);
     Ok(File { kind: Kind::Image, job, bytes, at_mm: corner_mm(min) })
 }
 
-/// The preview command for a rectangle (mm).
-pub fn preview(min: (f64, f64), max: (f64, f64)) -> Result<Vec<u8>, String> {
+/// The preview command for a rectangle (mm), with the light at `power` on an object `object_mm`
+/// across (the roller).
+pub fn preview(kind: crate::protocol::PreviewKind, min: (f64, f64), max: (f64, f64), power: u8, object_mm: f64) -> Result<Vec<u8>, String> {
     let (min, max) = ((min.0.min(max.0), min.1.min(max.1)), (min.0.max(max.0), min.1.max(max.1)));
     if min.0 < -1e-6 || min.1 < -1e-6 {
         return Err("the frame is outside the marking field".into());
     }
     let size = |d: f64| units_down(d, PER_MM).map(|v| v.max(1));
-    Ok(crate::protocol::preview(size(max.0 - min.0)?, size(max.1 - min.1)?, units_down(min.0.max(0.0), PER_MM)?, units_down(min.1.max(0.0), PER_MM)?))
+    Ok(crate::protocol::preview(kind, size(max.0 - min.0)?, size(max.1 - min.1)?, units_down(min.0.max(0.0), PER_MM)?, units_down(min.1.max(0.0), PER_MM)?, power, object_mm))
 }
 
 #[cfg(test)]
@@ -225,7 +231,7 @@ mod tests {
     fn image_header_matches_the_capture() {
         // A solid 14.9 × 12.5 mm block at (45.6, 44.9), drawn as 0.1 mm scan lines.
         let rows: Vec<(Vec<(f64, f64)>, f32)> = (0..125).map(|r| (vec![(45.6, 44.9 + (r as f64 + 0.5) / 10.0), (60.5, 44.9 + (r as f64 + 0.5) / 10.0)], 1.0)).collect();
-        let f = image_file(&rows, 0xA756D19E, "Untitled", Resolution::K1).unwrap();
+        let f = image_file(&rows, 0xA756D19E, "Untitled", Resolution::K1, false).unwrap();
         assert_eq!(&f.bytes[..16], &hex("10 00 95 00 7d a7 56 d1 9e 04 01 c8 01 c1 00 fe")[..]);
         assert_eq!(&f.bytes[NAME_AT..NAME_AT + 8], b"Untitled");
         assert_eq!(f.bytes.len(), 0x4901, "149 × 125 pixels after the header, as captured");
@@ -237,7 +243,8 @@ mod tests {
     fn finer_resolutions_match_the_captures() {
         // The same 14.85 × 12.45 mm block at (45.65, 44.95), as 2K scan lines 0.05 mm apart.
         let rows: Vec<(Vec<(f64, f64)>, f32)> = (0..249).map(|r| (vec![(45.65, 44.95 + (r as f64 + 0.5) / 20.0), (60.5, 44.95 + (r as f64 + 0.5) / 20.0)], 1.0)).collect();
-        let f = image_file(&rows, 0x79364E17, "Untitled", Resolution::K2).unwrap();
+        let f = image_file(&rows, 0x79364E17, "Untitled", Resolution::K2, false).unwrap();
+        assert_eq!(image_file(&rows, 1, "", Resolution::K2, true).unwrap().bytes[21], 1, "marked for the roller");
         assert_eq!(&f.bytes[..16], &hex("10 01 29 00 f9 79 36 4e 17 02 03 91 03 83 01 fc")[..]);
         assert_eq!(f.bytes.len(), 74017, "297 × 249 pixels after the header, as captured");
         assert_eq!(f.at_mm, (45, 44));
@@ -252,7 +259,7 @@ mod tests {
     fn image_pixels_follow_the_lines() {
         // Two short lines: the top row half burnt, a gap row, then a full row.
         let paths = vec![(vec![(1.0, 1.05), (1.2, 1.05)], 1.0), (vec![(1.0, 1.25), (1.4, 1.25)], 1.0), (vec![(1.0, 1.15), (5.0, 1.15)], 0.0)];
-        let f = image_file(&paths, 1, "t", Resolution::K1).unwrap();
+        let f = image_file(&paths, 1, "t", Resolution::K1, false).unwrap();
         let (w, h) = (u16::from_be_bytes([f.bytes[1], f.bytes[2]]), u16::from_be_bytes([f.bytes[3], f.bytes[4]]));
         assert_eq!((w, h), (4, 3));
         assert_eq!(&f.bytes[HEADER_LEN..], &[0, 0, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0]);
@@ -262,6 +269,7 @@ mod tests {
     fn bad_jobs_are_refused() {
         assert!(gcode_file(&[(vec![(0.0, 0.0), (1.0, 1.0)], 0.0)], 1, "").is_err(), "nothing burns");
         assert!(gcode_file(&[(vec![(-5.0, 0.0), (1.0, 1.0)], 1.0)], 1, "").is_err(), "off the field");
-        assert_eq!(preview((10.763, 14.576), (48.386, 41.639)).unwrap(), crate::protocol::preview(0x178, 0x10E, 0x6B, 0x91));
+        use crate::protocol::PreviewKind::Rectangle;
+        assert_eq!(preview(Rectangle, (10.763, 14.576), (48.386, 41.639), 1, 20.0).unwrap(), crate::protocol::preview(Rectangle, 0x178, 0x10E, 0x6B, 0x91, 1, 20.0));
     }
 }

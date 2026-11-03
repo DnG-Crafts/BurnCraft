@@ -25,7 +25,7 @@ const MAX_POLL_FAILURES_RUIDA: u32 = 8;
 /// How long a galvo red-light frame keeps tracing (unless stopped).
 const GALVO_FRAME_SECONDS: f64 = 15.0;
 /// How long a LaserPecker 2 preview keeps tracing (unless stopped).
-const LP2_PREVIEW: Duration = Duration::from_secs(15);
+pub const LP2_PREVIEW: Duration = Duration::from_secs(15);
 /// After starting a LaserPecker 2 job, how long it may still report idle before the job is taken
 /// to have ended (it reports engraving within about a second).
 const LP2_START_GRACE: Duration = Duration::from_secs(10);
@@ -66,7 +66,8 @@ pub enum DeviceCmd {
     ConnectRuida { target: RuidaTarget, model: RuidaModel },
     ConnectGcode { port: String, baud: u32, dtr: bool, options: Box<GcodeOptions> },
     ConnectGalvo(Box<GalvoSettings>),
-    ConnectLp2 { port: String, settings: bc_lp2::Settings },
+    /// `changed`: the settings were changed while disconnected, so they replace the machine's.
+    ConnectLp2 { port: String, settings: bc_lp2::Settings, changed: bool },
     /// LaserPecker 2: write the machine's own settings (beep, touch buttons, work mode…).
     Lp2Settings(bc_lp2::Settings),
     Disconnect,
@@ -89,6 +90,8 @@ pub enum DeviceCmd {
     WriteSettings(Vec<(u32, String)>),
     /// Trace a rectangle (machine mm) with the laser off, at `feed` mm/s (galvo: red light).
     Frame((f64, f64), (f64, f64), f64),
+    /// LaserPecker 2: show a rectangle (mm) with the preview light, in the given way.
+    Lp2Frame((f64, f64), (f64, f64), bc_lp2::PreviewKind),
     Run(Vec<MachineLayer>),
     Pause,
     Resume,
@@ -119,6 +122,8 @@ pub enum DeviceEvent {
     /// GRBL: how many settings were written, why writing stopped (if it did), and the settings
     /// read back afterwards.
     SettingsWritten { written: usize, error: Option<String>, settings: Option<Vec<(u32, String)>> },
+    /// LaserPecker 2: the machine's own settings, read when connecting.
+    Lp2Settings(bc_lp2::Settings),
 }
 
 /// UI-side handle to the worker, plus the latest known machine state.
@@ -140,6 +145,8 @@ pub struct Device {
     pub grbl_settings_read: u64,
     /// GRBL: the outcome of the last settings write.
     pub grbl_settings_note: Option<String>,
+    /// LaserPecker 2: the machine's settings as read on connecting, for the app to take on.
+    pub lp2_settings: Option<bc_lp2::Settings>,
     /// Jobs that ran to the end (not stopped or failed), counting up from 0.
     pub jobs_completed: u64,
     /// When the current (or last) job started, and when it finished.
@@ -197,6 +204,7 @@ impl Device {
             grbl_settings: None,
             grbl_settings_read: 0,
             grbl_settings_note: None,
+            lp2_settings: None,
             jobs_completed: 0,
             job_started: None,
             job_finished: None,
@@ -262,6 +270,7 @@ impl Device {
                         Err(e) => self.grbl_settings_note = Some(e),
                     }
                 }
+                DeviceEvent::Lp2Settings(s) => self.lp2_settings = Some(s),
                 DeviceEvent::SettingsWritten { written, error, settings } => {
                     self.grbl_settings_note = Some(match error {
                         None => format!("Wrote {written} setting{} to the controller", if written == 1 { "" } else { "s" }),
@@ -308,6 +317,10 @@ struct Lp2 {
     /// How far through the running file the job is.
     progress: ShapeProgress,
     preview_until: Option<Instant>,
+    /// The machine's settings as last written (roller, preview power).
+    settings: bc_lp2::Settings,
+    /// The error the machine last reported during this job (reported once).
+    reported_error: u8,
 }
 
 enum Backend {
@@ -467,13 +480,17 @@ impl Worker {
                     Err(e) => self.send(DeviceEvent::Disconnected(Some(format!("Could not connect to the galvo: {e}")))),
                 }
             }
-            DeviceCmd::ConnectLp2 { port, settings } => {
+            DeviceCmd::ConnectLp2 { port, settings, changed } => {
                 self.backend = None;
-                match bc_lp2::Controller::connect(&port, &settings) {
+                match bc_lp2::Controller::connect(&port, &settings, changed) {
                     Ok(controller) => {
-                        let lp2 = Lp2 { controller, queue: VecDeque::new(), files: 0, started: 0, running: None, engraving: false, progress: ShapeProgress::default(), preview_until: None };
-                        self.bed = Some(bc_lp2::FIELD);
-                        self.connected(Backend::Lp2(Box::new(lp2)), format!("LaserPecker 2 on {port}"), Some(bc_lp2::FIELD));
+                        // The machine's own settings, as read: shown in Devices and kept.
+                        let settings = controller.settings;
+                        let lp2 = Lp2 { controller, queue: VecDeque::new(), files: 0, started: 0, running: None, engraving: false, progress: ShapeProgress::default(), preview_until: None, settings, reported_error: 0 };
+                        let field = settings.field();
+                        self.bed = Some(field);
+                        self.connected(Backend::Lp2(Box::new(lp2)), format!("LaserPecker 2 on {port}"), Some(field));
+                        self.send(DeviceEvent::Lp2Settings(settings));
                     }
                     Err(e) => self.send(DeviceEvent::Disconnected(Some(format!("Could not connect on {port}: {e}")))),
                 }
@@ -485,7 +502,13 @@ impl Worker {
             DeviceCmd::Lp2Settings(settings) => {
                 let result = match &mut self.backend {
                     Some(Backend::Lp2(l)) if l.running.is_some() => Err("The LaserPecker's settings can't change during a job; they're sent when it next connects".to_string()),
-                    Some(Backend::Lp2(l)) => l.controller.write_settings(&settings).map_err(|e| format!("Couldn't change the LaserPecker's settings: {e}")),
+                    Some(Backend::Lp2(l)) => {
+                        let written = l.controller.write_settings(&settings).map_err(|e| format!("Couldn't change the LaserPecker's settings: {e}"));
+                        if written.is_ok() {
+                            l.settings = l.controller.settings;
+                        }
+                        written
+                    }
                     _ => Ok(()),
                 };
                 if let Err(e) = result {
@@ -560,6 +583,7 @@ fn ruida_command(c: &Controller, cmd: DeviceCmd, tx: &Sender<DeviceEvent>, ctx: 
                 .map(|()| Some(DeviceEvent::JobStarted))
                 .map_err(|e| e.to_string());
         }
+        DeviceCmd::Lp2Frame(..) => return Err("Only the LaserPecker 2 has a preview light".into()),
         DeviceCmd::ConnectRuida { .. } | DeviceCmd::ConnectGcode { .. } | DeviceCmd::ConnectGalvo(_) | DeviceCmd::ConnectLp2 { .. } | DeviceCmd::Lp2Settings(_) | DeviceCmd::Disconnect => unreachable!("handled by the worker"),
     };
     r.map(|()| None).map_err(|e| e.to_string())
@@ -612,6 +636,7 @@ fn gcode_command(g: &mut Grbl, options: &GcodeOptions, cmd: DeviceCmd) -> Result
             g.start_stream(bc_grbl::generate(&to_gcode_layers(layers), options));
             return Ok(Some(DeviceEvent::JobStarted));
         }
+        DeviceCmd::Lp2Frame(..) => return Err("Only the LaserPecker 2 has a preview light".into()),
         DeviceCmd::ConnectRuida { .. } | DeviceCmd::ConnectGcode { .. } | DeviceCmd::ConnectGalvo(_) | DeviceCmd::ConnectLp2 { .. } | DeviceCmd::Lp2Settings(_) | DeviceCmd::Disconnect => unreachable!("handled by the worker"),
     };
     r.map(|()| None).map_err(|e| e.to_string())
@@ -668,6 +693,7 @@ fn galvo_command(g: &mut Galvo, cmd: DeviceCmd, tx: &Sender<DeviceEvent>, ctx: &
             }
             return Ok(Some(DeviceEvent::JobStarted));
         }
+        DeviceCmd::Lp2Frame(..) => return Err("Only the LaserPecker 2 has a preview light".into()),
         DeviceCmd::ConnectRuida { .. } | DeviceCmd::ConnectGcode { .. } | DeviceCmd::ConnectGalvo(_) | DeviceCmd::ConnectLp2 { .. } | DeviceCmd::Lp2Settings(_) | DeviceCmd::Disconnect => unreachable!("handled by the worker"),
     };
     r.map(|()| None).map_err(|e| e.to_string())
@@ -693,17 +719,29 @@ struct ShapeProgress {
     shape: usize,
     last: u8,
     shown: f64,
+    /// Passes in the file (`shapes` repeats one pass's shapes this many times).
+    passes: usize,
 }
 
 impl ShapeProgress {
-    fn new(shapes: Vec<f64>) -> Self {
-        Self { shapes, ..Self::default() }
+    fn new(shapes: Vec<f64>, passes: usize) -> Self {
+        Self { shapes, passes: passes.max(1), ..Self::default() }
     }
 
-    /// Takes the machine's percentage; returns the fraction of the file done (below 1 until it ends).
-    fn update(&mut self, percent: u8) -> f64 {
+    /// Takes the machine's percentage and the pass it reports running (1, 2…; anything else is
+    /// ignored); returns the fraction of the file done (below 1 until it ends).
+    fn update(&mut self, percent: u8, pass: u8) -> f64 {
         let p = percent.min(100) as f64 / 100.0;
         let total: f64 = self.shapes.iter().sum();
+        // A later pass starts at its first shape, however many drops in progress were missed.
+        let per_pass = self.shapes.len() / self.passes;
+        if (1..=self.passes).contains(&(pass as usize)) && per_pass > 0 {
+            let first = (pass as usize - 1) * per_pass;
+            if first > self.shape {
+                self.shape = first;
+                self.last = 0;
+            }
+        }
         let fraction = if self.shapes.len() < 2 || total <= 0.0 {
             p
         } else {
@@ -720,7 +758,7 @@ impl ShapeProgress {
 
 /// The LaserPecker 2's files for a job: a G-code file per line layer, and a bitmap per engraving
 /// layer at the resolution nearest its line interval.
-fn lp2_files(layers: &[MachineLayer]) -> Result<VecDeque<Lp2File>, String> {
+fn lp2_files(layers: &[MachineLayer], roller: bool) -> Result<VecDeque<Lp2File>, String> {
     let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u32).unwrap_or(1);
     let mut files = VecDeque::new();
     for (i, l) in layers.iter().enumerate() {
@@ -734,15 +772,17 @@ fn lp2_files(layers: &[MachineLayer]) -> Result<VecDeque<Lp2File>, String> {
         let one_pass = if repeated { &l.paths[..n] } else { &l.paths[..] };
         let passes = if one_pass.len() < l.paths.len() { passes } else { 1 };
         // Progress starts again for each shape, and is assumed to for each pass.
-        let shapes: Vec<f64> = if l.raster {
+        let shapes: Vec<f64> = if l.raster || roller {
             vec![1.0; passes]
         } else {
             // The same paths, in the same order, as the G-code file burns.
             let lengths: Vec<f64> = one_pass.iter().filter(|(p, power)| *power > 0.0 && p.len() >= 2).map(|(p, _)| p.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).sum()).collect();
             lengths.repeat(passes)
         };
-        let file = if l.raster {
-            bc_lp2::job::image_file(one_pass, job, "BurnCraft", bc_lp2::Resolution::for_interval(l.interval))?
+        // The LP2 only engraves pictures with the electric roller (the app allows only Picture and
+        // Fill there), so line work is sent as a picture of its lines.
+        let file = if l.raster || roller {
+            bc_lp2::job::image_file(one_pass, job, "BurnCraft", bc_lp2::Resolution::for_interval(l.interval), roller)?
         } else {
             bc_lp2::job::gcode_file(one_pass, job, "BurnCraft")?
         };
@@ -750,6 +790,9 @@ fn lp2_files(layers: &[MachineLayer]) -> Result<VecDeque<Lp2File>, String> {
     }
     if files.is_empty() {
         return Err("Nothing to engrave".into());
+    }
+    if roller && files.len() > 1 {
+        return Err("With the electric roller, the LaserPecker 2 engraves one layer at a time. Put the design on one layer, or hide the other layers' shapes.".into());
     }
     Ok(files)
 }
@@ -760,14 +803,15 @@ fn lp2_next(l: &mut Lp2, tx: &Sender<DeviceEvent>, ctx: &egui::Context) -> Resul
     l.started += 1;
     let what = if l.files > 1 { "Sending part" } else { "Sending" };
     l.controller
-        .run(&file, power, speed, passes, |sent, total| {
+        .run(&file, power, speed, passes, bc_lp2::OBJECT_DIAMETER, |sent, total| {
             let _ = tx.send(DeviceEvent::Progress(sent, total, what));
             ctx.request_repaint();
         })
         .map_err(|e| format!("Couldn't start the job: {e}"))?;
     l.running = Some(Instant::now());
     l.engraving = false;
-    l.progress = ShapeProgress::new(shapes);
+    l.progress = ShapeProgress::new(shapes, passes as usize);
+    l.reported_error = 0;
     Ok(())
 }
 
@@ -784,7 +828,7 @@ fn lp2_poll(l: &mut Lp2, tx: &Sender<DeviceEvent>, ctx: &egui::Context) -> Resul
         match s.state {
             bc_lp2::State::Engraving => {
                 l.engraving = true;
-                let done = ((l.started - 1) as f64 + l.progress.update(s.progress)) * 1000.0;
+                let done = ((l.started - 1) as f64 + l.progress.update(s.progress, s.pass)) * 1000.0;
                 let _ = tx.send(DeviceEvent::Progress(done as usize, l.files * 1000, "Engraving"));
                 ctx.request_repaint();
             }
@@ -798,6 +842,22 @@ fn lp2_poll(l: &mut Lp2, tx: &Sender<DeviceEvent>, ctx: &egui::Context) -> Resul
             }
             _ => {}
         }
+        // Like the LP2 app: error 3 is the laser's temperature alarm, and mode 5 a failed job.
+        // Other values in the error byte turn up during normal jobs and mean nothing to the app.
+        let alarm = match (s.error, s.state) {
+            (3, _) => Some("The LaserPecker's laser is too hot (temperature alarm). Let it cool down."),
+            (_, bc_lp2::State::Other(5)) => Some("The LaserPecker reported that the job failed."),
+            _ => None,
+        };
+        let code = if s.error == 3 { 3 } else { 5 };
+        if let Some(text) = alarm
+            && l.reported_error != code
+        {
+            l.reported_error = code;
+            let _ = tx.send(DeviceEvent::Console(vec![text.to_string()]));
+            let _ = tx.send(DeviceEvent::Error(text.to_string()));
+            ctx.request_repaint();
+        }
     }
     let state = match s.state {
         bc_lp2::State::Idle => "Idle".to_string(),
@@ -806,11 +866,11 @@ fn lp2_poll(l: &mut Lp2, tx: &Sender<DeviceEvent>, ctx: &egui::Context) -> Resul
         bc_lp2::State::Other(n) => format!("State 0x{n:02X}"),
     };
     // There's no head to show: put the marker in the middle of the field.
-    Ok((MachineStatus { x: bc_lp2::FIELD.0 / 2.0, y: bc_lp2::FIELD.1 / 2.0, state }, finished))
+    Ok((MachineStatus { x: bc_lp2::FIELD.0 / 2.0, y: bc_lp2::FIELD.0 / 2.0, state }, finished))
 }
 
 fn lp2_command(l: &mut Lp2, cmd: DeviceCmd, tx: &Sender<DeviceEvent>, ctx: &egui::Context) -> Result<Option<DeviceEvent>, String> {
-    let busy = l.running.is_some() && !matches!(cmd, DeviceCmd::Stop);
+    let busy = l.running.is_some() && !matches!(cmd, DeviceCmd::Stop | DeviceCmd::Pause | DeviceCmd::Resume);
     if busy {
         return Err("A job is running; stop it first".into());
     }
@@ -819,9 +879,12 @@ fn lp2_command(l: &mut Lp2, cmd: DeviceCmd, tx: &Sender<DeviceEvent>, ctx: &egui
         DeviceCmd::Unlock => return Ok(None),
         DeviceCmd::Console(_) => return Ok(Some(DeviceEvent::Console(vec!["The console is only available for G-code controllers.".into()]))),
         DeviceCmd::ReadSettings | DeviceCmd::WriteSettings(_) => return Err("Machine settings can only be read from GRBL controllers".into()),
-        DeviceCmd::Pause | DeviceCmd::Resume => return Err("The LaserPecker 2 can't pause from BurnCraft. Stop ends the job.".into()),
-        DeviceCmd::Frame(min, max, _) => {
-            l.controller.preview(min, max).map_err(|e| format!("Couldn't preview: {e}"))?;
+        DeviceCmd::Pause | DeviceCmd::Resume if l.running.is_none() => return Err("No job is running".into()),
+        DeviceCmd::Pause => l.controller.job_state(bc_lp2::JobState::Hold).map_err(|e| e.to_string()),
+        DeviceCmd::Resume => l.controller.job_state(bc_lp2::JobState::Continue).map_err(|e| e.to_string()),
+        DeviceCmd::Frame(min, max, _) => lp2_command(l, DeviceCmd::Lp2Frame(min, max, bc_lp2::PreviewKind::Rectangle), tx, ctx).map(|_| ()),
+        DeviceCmd::Lp2Frame(min, max, kind) => {
+            l.controller.preview(kind, min, max, l.settings.preview_power, bc_lp2::OBJECT_DIAMETER).map_err(|e| format!("Couldn't preview: {e}"))?;
             l.preview_until = Some(Instant::now() + LP2_PREVIEW);
             return Ok(None);
         }
@@ -829,14 +892,22 @@ fn lp2_command(l: &mut Lp2, cmd: DeviceCmd, tx: &Sender<DeviceEvent>, ctx: &egui
             let was_running = l.running.take().is_some();
             l.queue.clear();
             l.preview_until = None;
+            if was_running {
+                // End the job, as the LP2 app does, then leave whatever mode it's in.
+                l.controller.job_state(bc_lp2::JobState::End).map_err(|e| e.to_string())?;
+            }
             l.controller.idle().map_err(|e| e.to_string())?;
             if was_running {
-                return Ok(Some(DeviceEvent::Error("Stop sent. If the LaserPecker keeps engraving, press the button on the machine.".into())));
+                return Ok(Some(DeviceEvent::Error("Job stopped".into())));
             }
             Ok(())
         }
         DeviceCmd::Run(layers) => {
-            l.queue = lp2_files(&layers)?;
+            // Like the LP2 app, only a warning: the LP2 doesn't always report the roller as connected.
+            if l.settings.roller() && !l.controller.query_status().map_err(|e| e.to_string())?.roller_connected {
+                let _ = tx.send(DeviceEvent::Console(vec!["The electric roller is switched on in Devices, but the LaserPecker doesn't report it as connected. Check it's plugged in.".into()]));
+            }
+            l.queue = lp2_files(&layers, l.settings.roller())?;
             l.files = l.queue.len();
             l.started = 0;
             l.preview_until = None;
@@ -892,7 +963,7 @@ mod tests {
 
     #[test]
     fn lp2_jobs_leave_the_passes_and_resolution_to_the_machine() {
-        let files = lp2_files(&[layer(false, 2, 0.1), layer(true, 3, 0.05)]).unwrap();
+        let files = lp2_files(&[layer(false, 2, 0.1), layer(true, 3, 0.05)], false).unwrap();
         assert_eq!(files.len(), 2);
         let (lines, image) = (&files[0], &files[1]);
         assert_eq!(lines.passes, 2);
@@ -904,24 +975,36 @@ mod tests {
         // Paths that don't simply repeat are sent as they are, once.
         let mut odd = layer(false, 2, 0.1);
         odd.paths.pop();
-        assert_eq!(lp2_files(&[odd]).unwrap()[0].passes, 1);
+        assert_eq!(lp2_files(&[odd], false).unwrap()[0].passes, 1);
+        // With the roller, lines go as a picture, and only one layer at a time.
+        let roller = lp2_files(&[layer(false, 2, 0.1)], true).unwrap();
+        assert_eq!(roller[0].file.kind, bc_lp2::Kind::Image);
+        assert_eq!(roller[0].file.bytes[21], 1, "marked for the roller");
+        assert!(lp2_files(&[layer(false, 2, 0.1), layer(true, 3, 0.05)], true).is_err());
     }
 
     #[test]
     fn lp2_progress_runs_through_the_shapes() {
         // Three shapes, the middle one twice as long; the machine counts 0-100 % for each.
-        let mut p = ShapeProgress::new(vec![10.0, 20.0, 10.0]);
-        assert!((p.update(50) - 0.125).abs() < 1e-9);
-        assert!((p.update(100) - 0.25).abs() < 1e-9);
-        assert!((p.update(25) - 0.375).abs() < 1e-9, "a drop means the second shape has begun");
-        assert!((p.update(90) - 0.7).abs() < 1e-9);
-        assert!((p.update(40) - 0.85).abs() < 1e-9);
-        assert_eq!(p.update(100), 0.99, "short of done until the machine says it's finished");
+        let mut p = ShapeProgress::new(vec![10.0, 20.0, 10.0], 1);
+        assert!((p.update(50, 1) - 0.125).abs() < 1e-9);
+        assert!((p.update(100, 1) - 0.25).abs() < 1e-9);
+        assert!((p.update(25, 1) - 0.375).abs() < 1e-9, "a drop means the second shape has begun");
+        assert!((p.update(90, 1) - 0.7).abs() < 1e-9);
+        assert!((p.update(40, 1) - 0.85).abs() < 1e-9);
+        assert_eq!(p.update(100, 1), 0.99, "short of done until the machine says it's finished");
         // A drop past the last shape, or a small wobble, never sends the bar backwards.
-        assert_eq!(p.update(5), 0.99);
+        assert_eq!(p.update(5, 1), 0.99);
         // A bitmap reports the whole file.
-        let mut image = ShapeProgress::new(Vec::new());
-        assert_eq!(image.update(42), 0.42);
-        assert_eq!(image.update(40), 0.42);
+        let mut image = ShapeProgress::new(Vec::new(), 1);
+        assert_eq!(image.update(42, 1), 0.42);
+        assert_eq!(image.update(40, 1), 0.42);
+        // Two passes of two equal shapes: the pass the machine reports puts the bar at its start,
+        // even if the drop between passes was missed.
+        let mut two = ShapeProgress::new(vec![1.0, 1.0, 1.0, 1.0], 2);
+        assert!((two.update(50, 1) - 0.125).abs() < 1e-9);
+        assert!((two.update(30, 2) - 0.575).abs() < 1e-9, "pass 2, first shape, 30%");
+        // A pass number that makes no sense is ignored.
+        assert!((two.update(40, 9) - 0.6).abs() < 1e-9);
     }
 }

@@ -163,6 +163,9 @@ pub struct BurnCraftApp {
     pub(crate) cut_editor: Option<usize>,
     /// A layer with shapes on it being removed: (layer, where its shapes go, or None to delete them).
     pub(crate) removing_layer: Option<(usize, Option<usize>)>,
+    /// LaserPecker 2 frame following the design: the (revision, selection) last framed, and when
+    /// it changed (s), to frame again once it settles.
+    lp2_frame_follow: Option<(FrameKey, Option<f64>)>,
     /// Shape Builder: the areas of the selected shapes, for (revision, selection) it was made from.
     builder: Option<(u64, BTreeSet<u64>, Option<bc_geom::curveops::Builder>)>,
     /// Radius used by the Round Corners tool (mm).
@@ -231,6 +234,7 @@ impl BurnCraftApp {
             current_layer: 0,
             file: None,
             revision: 0,
+            lp2_frame_follow: None,
             cut_order_revision: None,
             saved_revision: 0,
             status: "Ready".into(),
@@ -362,10 +366,11 @@ impl BurnCraftApp {
             return;
         }
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Projects", &[PROJECT_EXTENSION, "lbrn2", "lbrn", "rld"])
+            .add_filter("Projects", &[PROJECT_EXTENSION, "lbrn2", "lbrn", "rld", "lp2"])
             .add_filter("BurnCraft project", &[PROJECT_EXTENSION])
             .add_filter("LightBurn project", &bc_io::lightburn::EXTENSIONS)
             .add_filter("RDWorks project", &bc_io::rld::EXTENSIONS)
+            .add_filter("LaserPecker project", &bc_io::lp2::EXTENSIONS)
             .pick_file()
         else {
             return;
@@ -388,7 +393,7 @@ impl BurnCraftApp {
     fn open_path(&mut self, path: PathBuf) {
         crate::recovery::remember(&mut self.prefs.recent, &path);
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        if bc_io::lightburn::EXTENSIONS.contains(&ext.as_str()) || bc_io::rld::EXTENSIONS.contains(&ext.as_str()) {
+        if is_other_project(&ext) {
             return self.open_other_project(&path);
         }
         match Document::load(&path) {
@@ -402,7 +407,7 @@ impl BurnCraftApp {
 
     /// Reads another program's project (LightBurn or RDWorks), chosen by the file's extension.
     fn read_other_project(&self, ext: &str, bytes: &[u8]) -> Result<bc_io::lightburn::LbProject, String> {
-        if bc_io::rld::EXTENSIONS.contains(&ext) { bc_io::rld::import(bytes) } else { bc_io::lightburn::import(bytes, self.doc.bed_size.1, &self.fonts) }
+        bc_io::read_other_project(ext, bytes, self.doc.bed_size.1, &self.fonts)
     }
 
     /// Opens a LightBurn or RDWorks project as a new, unsaved BurnCraft document with its layer
@@ -502,6 +507,7 @@ impl BurnCraftApp {
         all.extend(bc_io::TOOLPATH_EXTENSIONS);
         all.extend(bc_io::lightburn::EXTENSIONS);
         all.extend(bc_io::rld::EXTENSIONS);
+        all.extend(bc_io::lp2::EXTENSIONS);
         all.extend(bc_io::IMAGE_EXTENSIONS);
         let Some(paths) = rfd::FileDialog::new()
             .add_filter("All supported", &all)
@@ -510,6 +516,7 @@ impl BurnCraftApp {
             .add_filter("G-code, HPGL, Ruida job", &bc_io::TOOLPATH_EXTENSIONS)
             .add_filter("LightBurn project", &bc_io::lightburn::EXTENSIONS)
             .add_filter("RDWorks project", &bc_io::rld::EXTENSIONS)
+            .add_filter("LaserPecker project", &bc_io::lp2::EXTENSIONS)
             .add_filter("Images", &bc_io::IMAGE_EXTENSIONS)
             .pick_files()
         else {
@@ -549,7 +556,7 @@ impl BurnCraftApp {
             self.selection = ids;
             return Ok(());
         }
-        if bc_io::lightburn::EXTENSIONS.contains(&ext.as_str()) || bc_io::rld::EXTENSIONS.contains(&ext.as_str()) {
+        if is_other_project(&ext) {
             let project = self.read_other_project(&ext, &bytes)?;
             if project.shapes.is_empty() {
                 return Err("no shapes found".into());
@@ -1200,6 +1207,35 @@ impl BurnCraftApp {
         }
     }
 
+    /// While the LaserPecker 2's frame is lit, frames the design again when it's moved or the
+    /// selection changes, once it has been still for half a second (as the LP2 app does).
+    fn follow_lp2_frame(&mut self, ctx: &egui::Context) {
+        let lit = self.laser.lp2_frame_until.get().is_some_and(|t| std::time::Instant::now() < t) && self.laser.device.connected && !self.laser.device.job_running();
+        if !lit {
+            self.laser.lp2_frame_until.set(None);
+            self.lp2_frame_follow = None;
+            return;
+        }
+        let Some((framed, changed)) = &mut self.lp2_frame_follow else { return };
+        let now = ctx.input(|i| i.time);
+        let key = (self.revision, self.selection.clone());
+        if key != *framed {
+            *framed = key;
+            *changed = Some(now);
+        }
+        let Some(at) = *changed else { return };
+        if now - at < 0.5 {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(0.5 - (now - at)));
+            return;
+        }
+        *changed = None;
+        let bed = self.doc.bed_size;
+        // A design moved off the work area just isn't framed again until it's back.
+        if let Ok(job) = self.design_job() {
+            let _ = self.laser.frame(&job, bed);
+        }
+    }
+
     pub(crate) fn laser_action(&mut self, action: LaserAction) {
         let bed = self.doc.bed_size;
         let result = self.design_job().and_then(|job| match action {
@@ -1207,10 +1243,24 @@ impl BurnCraftApp {
                 self.preview = Some(Preview::new(job, "design".into(), self.laser.settings.rapid_speed));
                 Ok(())
             }
-            LaserAction::Frame => self.laser.frame(&job, bed).map(|()| self.status = "Framing (laser off)".into()),
+            LaserAction::Frame | LaserAction::Lp2Frame(_) => {
+                let how = if let LaserAction::Lp2Frame(how) = action { how } else { crate::laser::Lp2Frame::Outline };
+                self.laser.lp2_frame.set(how);
+                self.laser.frame(&job, bed).map(|()| {
+                    self.status = match how {
+                        crate::laser::Lp2Frame::Outline => "Framing (laser off)",
+                        crate::laser::Lp2Frame::Centre => "Showing the job's centre",
+                        crate::laser::Lp2Frame::Rolling => "Rolling the frame along the job",
+                        crate::laser::Lp2Frame::Held => "Roller held",
+                    }
+                    .into();
+                    self.lp2_frame_follow = Some(((self.revision, self.selection.clone()), None));
+                })
+            }
             LaserAction::FrameOutline => self.laser.frame_with_laser(&job, bed).map(|_| ()),
             LaserAction::Start => self.laser.start(&job, bed, "Start this job on the laser?").map(|sent| {
                 if sent {
+                    self.laser.lp2_frame_until.set(None);
                     self.status = "Sending job…".into();
                     self.after_job_sent();
                 }
@@ -2271,6 +2321,14 @@ impl BurnCraftApp {
     }
 }
 
+/// Whether `ext` is another program's project (LightBurn, RDWorks or LaserPecker).
+fn is_other_project(ext: &str) -> bool {
+    bc_io::lightburn::EXTENSIONS.contains(&ext) || bc_io::rld::EXTENSIONS.contains(&ext) || bc_io::lp2::EXTENSIONS.contains(&ext)
+}
+
+/// What a frame was made from: the design revision and the selection.
+type FrameKey = (u64, BTreeSet<u64>);
+
 impl eframe::App for BurnCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         crate::startup::frame_shown();
@@ -2281,6 +2339,7 @@ impl eframe::App for BurnCraftApp {
                 self.canvas.request_fit();
                 self.status = format!("Work area for {}: {:.0} × {:.0} mm", self.laser.profile_name(), bed.0, bed.1);
             }
+        self.follow_lp2_frame(&ctx);
         // Files dropped onto the window are imported.
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         for path in dropped {

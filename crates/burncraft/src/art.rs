@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// File types the art folder shows.
-const ART_EXTENSIONS: [&str; 16] = ["bcproj", "svg", "dxf", "pdf", "ai", "eps", "emf", "wmf", "lbrn2", "lbrn", "rld", "png", "jpg", "jpeg", "bmp", "psd"];
+const ART_EXTENSIONS: [&str; 17] = ["bcproj", "svg", "dxf", "pdf", "ai", "eps", "emf", "wmf", "lbrn2", "lbrn", "rld", "lp2", "png", "jpg", "jpeg", "bmp", "psd"];
 /// Most files listed from a folder (and its subfolders).
 const MAX_FILES: usize = 1000;
 const THUMB: f32 = 76.0;
@@ -203,7 +203,7 @@ fn file_thumb(path: &Path, fonts: &bc_io::fonts::FontLibrary) -> Option<Vec<Vec<
             .filter(|s| !matches!(s.kind, ShapeKind::Image { .. }))
             .map(|s| s.world_path())
             .collect(),
-        "lbrn2" | "lbrn" | "rld" => if ext == "rld" { bc_io::rld::import(&bytes) } else { bc_io::lightburn::import(&bytes, 1000.0, fonts) }
+        "lbrn2" | "lbrn" | "rld" | "lp2" => bc_io::read_other_project(&ext, &bytes, 1000.0, fonts)
             .ok()?
             .shapes
             .into_iter()

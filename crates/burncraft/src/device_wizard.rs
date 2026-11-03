@@ -69,7 +69,7 @@ impl Wizard {
             ControllerKind::Grbl => s.bed = (400.0, 400.0),
             ControllerKind::Ruida => s.bed = (600.0, 400.0),
             ControllerKind::Galvo => s.bed = (s.galvo.lens_size, s.galvo.lens_size),
-            ControllerKind::Lp2 => s.bed = bc_lp2::FIELD,
+            ControllerKind::Lp2 => s.bed = s.lp2.field(),
         }
         self.name = label.to_string();
     }
@@ -109,7 +109,7 @@ impl Wizard {
         if settings.controller == ControllerKind::Galvo {
             settings.bed = (settings.galvo.lens_size, settings.galvo.lens_size);
         }
-        if let Some(field) = settings.controller.fixed_field() {
+        if let Some(field) = settings.fixed_field() {
             settings.bed = field;
         }
         DeviceProfile { name: self.name.trim().to_string(), settings }
@@ -155,7 +155,7 @@ impl Wizard {
                             ui.label("Lens field size");
                             units.drag(ui, &mut self.settings.galvo.lens_size, 10.0..=600.0);
                             ui.end_row();
-                        } else if let Some((w, h)) = self.settings.controller.fixed_field() {
+                        } else if let Some((w, h)) = self.settings.fixed_field() {
                             ui.label("Marking field");
                             ui.label(format!("{} × {}", units.format(w), units.format(h)));
                             ui.end_row();
@@ -363,7 +363,7 @@ pub fn summary(p: &DeviceProfile, units: Units) -> Vec<String> {
     };
     let size = if s.controller == ControllerKind::Galvo {
         format!("{} lens field", units.format(s.galvo.lens_size))
-    } else if let Some((w, h)) = s.controller.fixed_field() {
+    } else if let Some((w, h)) = s.fixed_field() {
         format!("{} × {} marking field", units.format(w), units.format(h))
     } else {
         format!("{} × {} work area, origin at {}", units.format(s.bed.0), units.format(s.bed.1), s.origin.label().to_lowercase())
@@ -407,8 +407,8 @@ impl Found {
         s.speed_unit = self.controller.default_speed_unit();
         if self.controller == ControllerKind::Ruida {
             s.ruida_usb = true;
-        } else if let Some(field) = self.controller.fixed_field() {
-            s.bed = field;
+        } else if self.controller == ControllerKind::Lp2 {
+            s.bed = bc_lp2::FIELD;
         } else {
             s.bed = (400.0, 400.0);
         }

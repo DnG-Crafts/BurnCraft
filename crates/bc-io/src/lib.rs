@@ -10,6 +10,7 @@ pub mod hpgl_import;
 pub mod lbdev;
 pub mod lbzip;
 pub mod lightburn;
+pub mod lp2;
 pub mod metafile;
 pub mod pdf_import;
 pub mod psd;
@@ -57,6 +58,18 @@ pub const IMAGE_EXTENSIONS: [&str; 11] = ["png", "jpg", "jpeg", "bmp", "gif", "t
 pub fn nearest_layer(color: [u8; 3]) -> usize {
     let d = |c: [u8; 3]| -> i32 { (0..3).map(|i| (c[i] as i32 - color[i] as i32).pow(2)).sum() };
     (0..bc_doc::LEGACY_CUT_LAYERS).min_by_key(|&i| d(bc_doc::Layer::color(i))).unwrap_or(0)
+}
+
+/// Reads another program's project (LightBurn, RDWorks or LaserPecker Design Space), chosen by
+/// its file extension. `bed_height` (mm) turns LightBurn's Y-up coordinates into ours.
+pub fn read_other_project(ext: &str, data: &[u8], bed_height: f64, fonts: &fonts::FontLibrary) -> Result<lightburn::LbProject, String> {
+    if rld::EXTENSIONS.contains(&ext) {
+        rld::import(data)
+    } else if lp2::EXTENSIONS.contains(&ext) {
+        lp2::import(data, fonts)
+    } else {
+        lightburn::import(data, bed_height, fonts)
+    }
 }
 
 #[cfg(test)]

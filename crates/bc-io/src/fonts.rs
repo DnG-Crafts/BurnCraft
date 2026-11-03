@@ -65,6 +65,20 @@ impl FontLibrary {
         Some(path)
     }
 
+    /// A font's capital height as a fraction of its em size (the size other programs give
+    /// fonts in). `None` if the font isn't installed.
+    pub fn cap_per_em(&self, family: &str, bold: bool, italic: bool) -> Option<f64> {
+        if family == single_line::FAMILY {
+            return Some(0.7);
+        }
+        let id = self.find(family, bold, italic)?;
+        self.db.with_face_data(id, |data, index| {
+            let face = ttf_parser::Face::parse(data, index).ok()?;
+            let cap = face.capital_height().filter(|&c| c > 0).map(f64::from).unwrap_or(face.ascender() as f64 * 0.7);
+            Some(cap / f64::from(face.units_per_em()))
+        })?
+    }
+
     /// Each letter of `text` as its own outline, placed exactly where [`Self::outline`] puts it
     /// (spaces and missing characters left out). For splitting text into letters.
     pub fn letters(&self, text: &str, family: &str, height: f64, bold: bool, italic: bool, style: &TextStyle) -> Option<Vec<(char, BezPath)>> {

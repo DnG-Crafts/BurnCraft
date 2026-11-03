@@ -8,6 +8,7 @@ license.workspace = true
 barcoders = "2.0.0"
 bc-doc = { version = "0.1.0", path = "../bc-doc" }
 bc-geom = { version = "0.1.0", path = "../bc-geom" }
+bc-lp2 = { version = "0.1.0", path = "../bc-lp2" }
 csv = "1.4.0"
 dxf = "0.6.2"
 image = "0.25.10"

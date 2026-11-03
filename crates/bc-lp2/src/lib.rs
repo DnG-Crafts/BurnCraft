@@ -13,7 +13,7 @@ pub mod settings;
 
 pub use controller::{Controller, Error, Port};
 pub use job::{File, Kind, Resolution};
-pub use protocol::{State, Status};
+pub use protocol::{JobState, PreviewKind, State, Status};
 pub use settings::{Settings, WorkMode};
 
 /// The baud rate the LP2's app sets on the CH340.
@@ -21,6 +21,14 @@ pub const BAUD: u32 = 460_800;
 
 /// The LP2's marking field (mm). Coordinates are measured from its top-left corner.
 pub const FIELD: (f64, f64) = (100.0, 100.0);
+
+/// The field with the Versatile Electric Roller (mm): the roller carries the work along Y, so a
+/// job can be 2 m long, as in the LP2 app.
+pub const ROLLER_FIELD: (f64, f64) = (100.0, 2000.0);
+
+/// The object diameter (mm) sent with previews and jobs. The LP2 app only lets it be set for the
+/// gripper accessory (other models); for the LP2 it always sends this default.
+pub const OBJECT_DIAMETER: f64 = 20.0;
 
 /// A nominal top marking speed (mm/s). BurnCraft keeps speeds in mm/s, while the LP2 takes a
 /// percentage of its top speed; this is what 100 % stands for.

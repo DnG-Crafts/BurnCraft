@@ -30,7 +30,8 @@ impl PortInfo {
         self.usb.is_some_and(|(vid, _)| vid == 0x0403)
     }
 
-    /// WCH CH340/CH341 chips, used by many diode lasers and the LaserPecker 2.
+    /// WCH chips (CH340/CH341, CH9102 and so on), used by many diode lasers and the LaserPecker 2
+    /// (1A86:7523 or 1A86:55D4).
     pub fn is_ch340(&self) -> bool {
         self.usb.is_some_and(|(vid, _)| vid == 0x1A86)
     }

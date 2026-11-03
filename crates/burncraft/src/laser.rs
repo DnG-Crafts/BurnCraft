@@ -48,11 +48,6 @@ impl ControllerKind {
 
     /// The usual speed unit: per minute for G-code machines (their feed rates are per minute),
     /// per second for the rest.
-    /// A fixed marking field (mm), for machines whose work area can't be changed.
-    pub fn fixed_field(self) -> Option<(f64, f64)> {
-        (self == ControllerKind::Lp2).then_some(bc_lp2::FIELD)
-    }
-
     pub fn default_speed_unit(self) -> SpeedUnit {
         match self {
             ControllerKind::Grbl => SpeedUnit::PerMinute,
@@ -123,6 +118,14 @@ pub struct LaserSettings {
     pub speed_unit: SpeedUnit,
 }
 
+impl LaserSettings {
+    /// A fixed marking field (mm), for machines whose work area is set by the machine: the
+    /// LaserPecker 2's, which grows along Y with its roller.
+    pub fn fixed_field(&self) -> Option<(f64, f64)> {
+        (self.controller == ControllerKind::Lp2).then(|| self.lp2.field())
+    }
+}
+
 /// Where a job is placed on the machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum StartFrom {
@@ -149,12 +152,25 @@ impl StartFrom {
 
 /// The LaserPecker 2's own settings, as rows of a two-column grid.
 fn lp2_settings_rows(ui: &mut egui::Ui, s: &mut bc_lp2::Settings) {
-    ui.label("Work mode");
-    egui::ComboBox::from_id_salt("lp2-mode").selected_text(s.mode.label()).show_ui(ui, |ui| {
-        for m in bc_lp2::WorkMode::ALL {
-            ui.selectable_value(&mut s.mode, m, m.label());
-        }
-    });
+    ui.label("Electric roller").on_hover_text("The Versatile Electric Roller accessory: off engraves a flat surface");
+    let mut roller = s.roller();
+    if ui.checkbox(&mut roller, "").on_hover_text("The Versatile Electric Roller accessory: off engraves a flat surface").changed() {
+        s.set_roller(roller);
+    }
+    ui.end_row();
+    if s.roller() {
+        ui.label("Roller mode");
+        egui::ComboBox::from_id_salt("lp2-roller-mode").selected_text(s.mode.label()).show_ui(ui, |ui| {
+            for m in bc_lp2::WorkMode::ROLLER {
+                if ui.selectable_label(s.mode == m, m.label()).clicked() {
+                    s.set_roller_mode(m);
+                }
+            }
+        });
+        ui.end_row();
+    }
+    ui.label("Preview light power").on_hover_text("How bright the Frame preview is. 1 is the LaserPecker app's own; higher is easier to see but can mark some materials.");
+    ui.add(egui::DragValue::new(&mut s.preview_power).range(1..=10));
     ui.end_row();
     let rows: [(&str, &str, &mut bool); 5] = [
         ("Path optimization", "Order line work for a quicker job", &mut s.path_optimization),
@@ -171,8 +187,9 @@ fn lp2_settings_rows(ui: &mut egui::Ui, s: &mut bc_lp2::Settings) {
     ui.label("Free mode").on_hover_text("Lets the laser fire without its protective cover");
     let mut free = s.free_mode;
     if ui.checkbox(&mut free, "").on_hover_text("Lets the laser fire without its protective cover").changed() {
-        s.free_mode = !free
-            || rfd::MessageDialog::new()
+        // Turning it off is immediate; turning it on asks first.
+        s.free_mode = free
+            && rfd::MessageDialog::new()
                 .set_level(rfd::MessageLevel::Warning)
                 .set_title("Free mode")
                 .set_description(
@@ -435,9 +452,25 @@ impl Default for LaserSettings {
     }
 }
 
+/// How the LaserPecker 2 shows the job with its preview light.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Lp2Frame {
+    /// The job's bounding box.
+    #[default]
+    Outline,
+    /// Just the middle of the job, as a point.
+    Centre,
+    /// With the electric roller: the box, the roller turning to show its whole length.
+    Rolling,
+    /// With the electric roller: the box, the roller held still.
+    Held,
+}
+
 /// What the laser panels ask the app to do.
 pub enum LaserAction {
     Frame,
+    /// LaserPecker 2: show the job's centre, or (with the roller) turn or hold the roller.
+    Lp2Frame(Lp2Frame),
     /// Trace the job's outline (convex box) with the laser on at very low power.
     FrameOutline,
     Start,
@@ -453,6 +486,13 @@ pub struct Laser {
     pending_bed: Option<(f64, f64)>,
     /// Estimated duration (s) of the last job sent.
     pub job_estimate: std::cell::Cell<Option<f64>>,
+    /// LaserPecker 2: its settings were changed while disconnected, to be written when it connects
+    /// (otherwise the machine's own are kept).
+    lp2_changed: bool,
+    /// LaserPecker 2: when its frame light goes out, while it's lit (so the frame can follow the design).
+    pub lp2_frame_until: std::cell::Cell<Option<std::time::Instant>>,
+    /// LaserPecker 2: how Frame shows the job (kept while the frame follows the design).
+    pub lp2_frame: std::cell::Cell<Lp2Frame>,
     pub device: Device,
     ports: Vec<String>,
     console_input: String,
@@ -478,7 +518,7 @@ impl Laser {
         let store = store.unwrap_or_else(|| DeviceStore { profiles: legacy.into_iter().map(|settings| DeviceProfile { name: "My laser".into(), settings }).collect(), active: 0 });
         let active = store.active.min(store.profiles.len().saturating_sub(1));
         let settings = store.profiles.get(active).map(|p| p.settings.clone()).unwrap_or_default();
-        Self { settings, profiles: store.profiles, active, pending_bed: None, job_estimate: Default::default(), device, ports: bc_grbl::list_ports(), console_input: String::new(), goto: (0.0, 0.0), editing: false, wizard: None, finder: None, units: Units::default(), grbl_config: Default::default(), held_jog: None, held_seen: false }
+        Self { settings, profiles: store.profiles, active, pending_bed: None, job_estimate: Default::default(), lp2_frame_until: Default::default(), lp2_frame: Default::default(), lp2_changed: false, device, ports: bc_grbl::list_ports(), console_input: String::new(), goto: (0.0, 0.0), editing: false, wizard: None, finder: None, units: Units::default(), grbl_config: Default::default(), held_jog: None, held_seen: false }
     }
 
     /// The device list for saving.
@@ -589,6 +629,13 @@ impl Laser {
             self.device.send(DeviceCmd::JogKey(key, false));
         }
         let reported = self.device.poll();
+        if let Some(s) = self.device.lp2_settings.take() {
+            // The LaserPecker's own settings replace what was saved, so Devices shows the truth.
+            self.settings.lp2 = s;
+            self.settings.bed = s.field();
+            self.pending_bed = Some(s.field());
+            self.keep_settings();
+        }
         if std::mem::take(&mut self.device.just_connected) && self.settings.home_on_connect {
             self.device.send(DeviceCmd::Home);
         }
@@ -625,7 +672,7 @@ impl Laser {
             let lens = self.settings.galvo.lens_size;
             return MachineConfig { bed: (lens, lens), origin: OriginCorner::TopLeft, rapid_speed: self.settings.galvo.jump_speed };
         }
-        if let Some(field) = self.settings.controller.fixed_field() {
+        if let Some(field) = self.settings.fixed_field() {
             return MachineConfig { bed: field, origin: OriginCorner::TopLeft, rapid_speed: bc_lp2::MAX_SPEED };
         }
         MachineConfig { bed, origin: self.settings.origin, rapid_speed: self.settings.rapid_speed }
@@ -770,6 +817,17 @@ impl Laser {
             let ring = vec![min, (max.0, min.1), max, (min.0, max.1), min];
             let layer = MachineLayer { speed: self.settings.rapid_speed, min_power: 0.0, max_power: 0.0, air_assist: false, frequency: 30.0, color: [0, 0, 0], raster: false, passes: 1, interval: 0.1, z_offset: 0.0, z_step: 0.0, delay_on: 0.0, delay_off: 0.0, paths: vec![(ring, 0.0)] };
             self.device.send(DeviceCmd::Run(vec![layer]));
+        } else if self.settings.controller == ControllerKind::Lp2 {
+            let centre = ((min.0 + max.0) / 2.0, (min.1 + max.1) / 2.0);
+            let roller = self.settings.lp2.roller();
+            let cmd = match self.lp2_frame.get() {
+                Lp2Frame::Centre => DeviceCmd::Lp2Frame(centre, centre, bc_lp2::PreviewKind::Rectangle),
+                Lp2Frame::Rolling if roller => DeviceCmd::Lp2Frame(min, max, bc_lp2::PreviewKind::Rolling),
+                Lp2Frame::Held if roller => DeviceCmd::Lp2Frame(min, max, bc_lp2::PreviewKind::Roller),
+                _ => DeviceCmd::Lp2Frame(min, max, bc_lp2::PreviewKind::Rectangle),
+            };
+            self.device.send(cmd);
+            self.lp2_frame_until.set(Some(std::time::Instant::now() + crate::device::LP2_PREVIEW));
         } else {
             self.device.send(DeviceCmd::Frame(min, max, self.settings.rapid_speed));
         }
@@ -939,7 +997,8 @@ impl Laser {
                 self.device.message = Some("Connecting to the galvo over USB…".into());
             }
             ControllerKind::Lp2 => {
-                self.device.send(DeviceCmd::ConnectLp2 { port: s.serial_port.clone(), settings: s.lp2 });
+                self.device.send(DeviceCmd::ConnectLp2 { port: s.serial_port.clone(), settings: s.lp2, changed: self.lp2_changed });
+                self.lp2_changed = false;
                 self.device.message = Some(format!("Connecting on {}…", s.serial_port));
             }
         }
@@ -979,6 +1038,7 @@ impl Laser {
                 self.device.set_paused(paused);
             }
             if ui.add_enabled(connected, big("■ Stop").fill(Color32::from_rgb(180, 40, 40))).clicked() {
+                self.lp2_frame_until.set(None);
                 self.device.stop();
             }
         });
@@ -992,9 +1052,11 @@ impl Laser {
         ui.horizontal(|ui| {
             if self.settings.controller == ControllerKind::Lp2 {
                 // The LP2's preview already traces the outline with its low-power light.
-                let frame = egui::Button::new("Frame").min_size(egui::vec2(ui.available_width(), 30.0));
-                if ui.add_enabled(connected, frame).on_hover_text("Trace the job's bounding box with the preview light").clicked() {
+                if ui.add_enabled(connected, big("Frame")).on_hover_text("Trace the job's bounding box with the preview light").clicked() {
                     action = Some(LaserAction::Frame);
+                }
+                if ui.add_enabled(connected, big("Frame centre")).on_hover_text("Point the preview light at the middle of the job, for lining it up").clicked() {
+                    action = Some(LaserAction::Lp2Frame(Lp2Frame::Centre));
                 }
                 return;
             }
@@ -1005,6 +1067,18 @@ impl Laser {
                 action = Some(LaserAction::FrameOutline);
             }
         });
+        if self.settings.controller == ControllerKind::Lp2 && self.settings.lp2.roller() {
+            // As in the LP2 app: once the frame is lit, the roller can turn it along the job.
+            let lit = connected && self.lp2_frame_until.get().is_some();
+            ui.horizontal(|ui| {
+                if ui.add_enabled(lit, big("Roll preview")).on_hover_text("Turn the roller so the frame runs along the whole job (Frame first)").clicked() {
+                    action = Some(LaserAction::Lp2Frame(Lp2Frame::Rolling));
+                }
+                if ui.add_enabled(lit, big("Stop rolling")).on_hover_text("Hold the roller still, keeping the frame lit").clicked() {
+                    action = Some(LaserAction::Lp2Frame(Lp2Frame::Held));
+                }
+            });
+        }
         ui.horizontal(|ui| {
             if ui.add_enabled(connected, big("Home")).clicked() {
                 self.device.send(DeviceCmd::Home);
@@ -1387,11 +1461,15 @@ impl Laser {
                 egui::Grid::new("device-grid-2").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     if self.settings.controller == ControllerKind::Lp2 {
                         // A fixed field and speeds set as depth; what's left are the machine's own
-                        // settings, sent when connecting and as soon as one is changed.
+                        // settings, sent as soon as one is changed, or when connecting if changed before.
                         let before = self.settings.lp2;
                         lp2_settings_rows(ui, &mut self.settings.lp2);
-                        if self.settings.lp2 != before && connected {
-                            self.device.send(DeviceCmd::Lp2Settings(self.settings.lp2));
+                        if self.settings.lp2 != before {
+                            if connected {
+                                self.device.send(DeviceCmd::Lp2Settings(self.settings.lp2));
+                            } else {
+                                self.lp2_changed = true;
+                            }
                         }
                         return;
                     }
@@ -1462,9 +1540,10 @@ impl Laser {
                 }
             }
             if self.settings.controller == ControllerKind::Lp2 {
-                ui.weak("The LaserPecker 2 marks a 100 × 100 mm field. Speeds are set as depth (1-100 %), as in its own app. On Windows it needs the CH340 driver.");
-                if *bed != bc_lp2::FIELD {
-                    *bed = bc_lp2::FIELD;
+                ui.weak("The LaserPecker 2 marks a 100 × 100 mm field (100 × 2000 mm with the electric roller). Speeds are set as depth (1-100 %), as in its own app. On Windows it needs the CH340 driver.");
+                let field = self.settings.lp2.field();
+                if *bed != field {
+                    *bed = field;
                     bed_changed = true;
                 }
             }

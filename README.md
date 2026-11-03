@@ -19,7 +19,7 @@
 
 BurnCraft is a desktop app for laser cutters and engravers. It covers the whole workflow in one window: draw or import a design, assign cut, fill and image settings by layer, preview the toolpath with a time estimate, then frame and run the job on the machine.
 
-It drives **Ruida** DSP controllers (most CO2 lasers), **G-code** machines (GRBL, Marlin, Smoothieware, plus diode lasers like the LaserPecker LP2 Plus) and **galvo** fiber/UV/CO2 markers. It also opens **LightBurn** project files and device profiles, and **RDWorks** projects, so you can bring your existing work with you.
+It drives **Ruida** DSP controllers (most CO2 lasers), **G-code** machines (GRBL, Marlin, Smoothieware, plus diode lasers like the LaserPecker LP2 Plus) and **galvo** fiber/UV/CO2 markers. It also opens **LightBurn** project files and device profiles, **RDWorks** projects and **LaserPecker Design Space** projects, so you can bring your existing work with you.
 
 > [!WARNING]
 > BurnCraft is in early development. Ruida over Ethernet has been run on real hardware (RDC6445G). The other drivers are tested against simulated controllers only. Lasers are dangerous: always supervise a running job, keep the lid closed, and keep a fire extinguisher nearby. See [Safety](#safety).
@@ -55,6 +55,7 @@ It drives **Ruida** DSP controllers (most CO2 lasers), **G-code** machines (GRBL
 - **Machine profiles:** keep a list of lasers, switch between them, import LightBurn `.lbdev` device files and `.lbzip` exports (for example the ones LaserPecker publishes), and export your machines to BurnCraft `.bcdev` files to move them to another computer.
 - **Opens LightBurn files:** `.lbrn2` / `.lbrn` projects open with their layers, shapes, groups, images and editable text.
 - **Opens RDWorks files:** `.rld` projects saved by RDWorks V8 open with their layers (colour, mode, speed, power, output), lines and curves, text, pictures and groups.
+- **Opens LaserPecker Design Space files:** `.lp2` projects open with their shapes, text, pictures and groups on Fill, Picture, Line and Cut layers, with each layer's depth, power, passes and resolution.
 - **Accurate preview:** see every burn, overscan and travel move with a scrubber and a time estimate before you fire the laser, or play the job as a simulation.
 - **Check Design:** finds open shapes, duplicates, shared edges, tiny leftovers and shapes off the bed before a job, with one-click fixes.
 - **Variable text:** serial numbers, dates and CSV merge for batches of tags, labels and name plates.
@@ -220,6 +221,7 @@ If you run BurnCraft on any of the untested controllers, a report of how it went
 | LightBurn project (`.lbrn2`, `.lbrn`) | ✅ Layers, shapes, groups, paths, images, editable text | - |
 | LightBurn device (`.lbdev`) | ✅ As machine profiles | - |
 | RDWorks project (`.rld`, RDWorks V8) | ✅ Layers (colour, speed, power, output, scan interval), lines and curves, text outlines, pictures, groups | - |
+| LaserPecker Design Space project (`.lp2`) | ✅ Shapes, paths, editable text, pictures, groups, hidden objects (on hidden layers); Fill / Picture / Line / Cut layers with depth, power, passes and resolution | - |
 | SVG | ✅ Colours map to layers; text becomes outlines | ✅ |
 | DXF | ✅ Lines, polylines with arcs, circles, arcs, ellipses, splines; units honoured | ✅ Polylines in mm, one DXF layer per BurnCraft layer, in its colour |
 | PDF | ✅ Vector paths from the first page (colours pick layers); text and images are reported, not imported | - |
@@ -341,12 +343,12 @@ The LP2 doesn't speak G-code, so it has its own controller type instead of a dev
 
 1. Close the LaserPecker app so the USB port is free. On Windows the LP2 needs the CH340 driver.
 2. In **Devices**, use **Find My Laser** (it recognises the LP2), or **Create Manually** and choose **LaserPecker 2** and its serial port.
-3. Under the machine's details in **Devices** are the LP2's own settings (work mode, beep, touch buttons, engraving direction, free mode and so on). They're sent each time it connects.
+3. Under the machine's details in **Devices** are the LP2's own settings (electric roller and its mode, beep, touch buttons, engraving direction, free mode and so on). When BurnCraft connects it reads them from the LP2 and writes the same values straight back, as the LaserPecker app does (the LP2 beeps). If you changed any in Devices while disconnected, your choices are written instead. While connected, a change is sent straight away.
 4. Layer speeds are shown as **depth** (1-100 %), like the LaserPecker app: deeper is slower. Power is the layer's max power.
-5. **Frame** traces the job's outline with the LP2's preview light for 15 seconds (or until **Stop**).
+5. **Frame** traces the job's outline with the LP2's preview light for 15 seconds (or until **Stop**). While it's lit, moving the design or changing the selection frames it again after half a second. **Frame centre** points the light at just the middle of the job, for lining it up. With the roller on, once the frame is lit, **Roll preview** turns the roller so the frame runs along the whole job and **Stop rolling** holds it still. With the electric roller on, the LP2 only engraves pictures, so line layers are sent as a picture of their lines, and only one layer can be engraved at a time.
 6. Line layers are sent as G-code; Fill and Image layers are sent as a bitmap at the LP2's 1K, 1.3K or 2K resolution: Image layers choose it from a Resolution drop-down, and Fill layers use the one nearest their line interval. The machine runs the passes itself. A job with several layers runs them one after another.
 
-The LP2 can't pause from BurnCraft, and has no head to jog or home. **Stop** sends the same command the LaserPecker app uses to end a preview; if a job keeps going, press the button on the machine.
+**Pause**, **Resume** and **Stop** work as in the LaserPecker app. With the roller on, if the LP2 doesn't report the roller as connected, the Console tab says so (the job still runs, as in the LaserPecker app), and the LP2's temperature alarm or a failed job is shown.
 
 </details>
 
@@ -391,7 +393,7 @@ BurnCraft is a Cargo workspace. Everything except the app itself is a standalone
 | [`bc-geom`](crates/bc-geom) | Geometry on top of `kurbo`: outlines, flattening, hit testing, booleans and offsets (via `geo`), node editing, fillets |
 | [`bc-doc`](crates/bc-doc) | Document model: shapes, layers, groups, undo history, project files, editing operations, nesting, variable text |
 | [`bc-raster`](crates/bc-raster) | Image decoding, adjustments, resampling, dithering, tracing |
-| [`bc-io`](crates/bc-io) | LightBurn / RDWorks / SVG / DXF / image import, `.lbdev` device files, SVG export, fonts and text outlines, barcodes, CSV |
+| [`bc-io`](crates/bc-io) | LightBurn / RDWorks / LaserPecker / SVG / DXF / image import, `.lbdev` device files, SVG export, fonts and text outlines, barcodes, CSV |
 | [`bc-job`](crates/bc-job) | Job builder: kerf, tabs, lead-ins, ordering, fills, overscan, image rasterising, grayscale, time estimates |
 | [`bc-ruida`](crates/bc-ruida) | Ruida driver: per-model byte scrambling, job encoding, UDP and USB links, machine control |
 | [`bc-grbl`](crates/bc-grbl) | G-code driver: generation for each dialect, response parsing, streaming, machine control |
