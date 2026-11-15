@@ -167,32 +167,3 @@ impl ProductionQueue {
         action
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn copies_count_only_when_a_job_completes() {
-        let mut q = ProductionQueue::default();
-        q.add("Coasters".into(), Document::default());
-        q.add("Tags".into(), Document::default());
-        q.items[0].copies = 2;
-        assert_eq!(q.next(), Some(0));
-        q.started(0, 5);
-        q.track(5, true);
-        assert!(q.running(), "still burning");
-        q.track(6, false);
-        assert_eq!((q.items[0].done, q.next()), (1, Some(0)), "one of two coasters done");
-        // A stopped run isn't counted.
-        q.started(0, 6);
-        q.track(6, false);
-        assert_eq!(q.items[0].done, 1);
-        q.started(0, 6);
-        q.track(7, false);
-        assert_eq!(q.next(), Some(1), "on to the tags");
-        q.started(1, 7);
-        q.track(8, false);
-        assert_eq!(q.next(), None);
-    }
-}

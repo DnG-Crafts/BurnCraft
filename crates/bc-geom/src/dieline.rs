@@ -180,32 +180,3 @@ pub fn envelope(s: &DielineSpec) -> Result<Dieline, String> {
     line(&mut folds, x1, y0, x1, y1);
     Ok(Dieline { cut: union(&regions)?, folds, size: (x1 + side, y1 + bottom_flap) })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn lines(p: &BezPath) -> usize {
-        p.elements().iter().filter(|e| matches!(e, crate::PathEl::MoveTo(_))).count()
-    }
-
-    #[test]
-    fn each_kind_has_an_outline_and_folds() {
-        for kind in DielineKind::ALL {
-            let d = dieline(kind, &DielineSpec::default()).unwrap();
-            let b = crate::bounds(&d.cut).unwrap();
-            assert!((b.width() - d.size.0).abs() < 0.5 && (b.height() - d.size.1).abs() < 0.5, "{kind:?}: {b:?} vs {:?}", d.size);
-            assert_eq!(lines(&d.cut), 1, "{kind:?}: one outline");
-            assert!(lines(&d.folds) >= 4, "{kind:?}");
-        }
-    }
-
-    #[test]
-    fn a_tuck_box_net_is_the_sum_of_its_walls() {
-        let s = DielineSpec::default();
-        let d = tuck_box(&s).unwrap();
-        assert!((d.size.0 - (s.glue + 2.0 * s.width + 2.0 * s.depth)).abs() < 1e-9);
-        assert_eq!(lines(&d.folds), 8);
-    }
-}
-

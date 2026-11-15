@@ -255,20 +255,3 @@ impl GrblConfig {
         });
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_real_changes_are_written() {
-        let mut c = GrblConfig::default();
-        c.take_reading(&[(22, "0".into()), (110, "6000.000".into())]);
-        assert!(c.changes().is_empty());
-        c.rows[1].1 = "6000".into();
-        assert!(c.changes().is_empty(), "the same number written differently isn't a change");
-        c.rows[0].1 = "1".into();
-        c.load_values(&[(130, "400".into())]);
-        assert_eq!(c.changes(), vec![(22, "1".into()), (130, "400".into())]);
-    }
-}

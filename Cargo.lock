@@ -634,6 +634,7 @@ dependencies = [
  "barcoders",
  "bc-doc",
  "bc-geom",
+ "bc-lp2",
  "csv",
  "dxf",
  "image",
@@ -654,7 +655,6 @@ dependencies = [
  "bc-doc",
  "bc-geom",
  "bc-raster",
- "image",
  "serde",
 ]
 
@@ -662,6 +662,7 @@ dependencies = [
 name = "bc-lp2"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serialport",
 ]
 
@@ -848,7 +849,6 @@ dependencies = [
  "tiny-skia",
  "tiny_http",
  "winresource",
- "zip",
 ]
 
 [[package]]

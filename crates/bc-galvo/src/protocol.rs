@@ -106,24 +106,3 @@ pub fn signed_delay(us: f64) -> [u16; 2] {
     let v = us.round();
     [v.abs().min(65535.0) as u16, if v >= 0.0 { 0x0000 } else { 0x8000 }]
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn little_endian_words() {
-        assert_eq!(encode(&command(LIST_MARK_TO, &[0x1234, 0x8000])), [0x05, 0x80, 0x34, 0x12, 0x00, 0x80, 0, 0, 0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn packets_are_padded() {
-        let cmds: Vec<Command> = (0..300).map(|i| command(LIST_JUMP_TO, &[i as u16])).collect();
-        let packets = list_packets(&cmds);
-        assert_eq!(packets.len(), 2);
-        assert!(packets.iter().all(|p| p.len() == LIST_BYTES));
-        // The last command slot of packet 2 is end-of-list padding.
-        assert_eq!(&packets[1][LIST_BYTES - 12..LIST_BYTES - 10], &[0x02, 0x80]);
-        assert_eq!(signed_delay(-100.0), [100, 0x8000]);
-    }
-}

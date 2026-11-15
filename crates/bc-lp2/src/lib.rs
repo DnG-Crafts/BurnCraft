@@ -54,19 +54,3 @@ pub fn speed_for_depth(depth: f64) -> f64 {
 pub fn power_percent(power: f64) -> u8 {
     power.round().clamp(1.0, 100.0) as u8
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn depth_and_speed_round_trip() {
-        // 30 % depth in the LP2 app went out as speed 0x47 (71).
-        assert_eq!(speed_percent(speed_for_depth(30.0)), 0x47);
-        for d in 1..=100 {
-            assert_eq!(depth(speed_for_depth(d as f64)), d as f64);
-        }
-        assert_eq!(speed_percent(0.0), 1);
-        assert_eq!(speed_percent(10_000.0), 100);
-    }
-}

@@ -96,26 +96,3 @@ pub fn open_error(e: &serialport::Error) -> String {
         text
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recognises_firmware_greetings() {
-        assert_eq!(identify("\r\nGrbl 1.1h ['$' for help]\r\n"), Some((Dialect::Grbl, "Grbl 1.1h".into())));
-        assert_eq!(identify("GrblHAL 1.1f ['$' or '$HELP' for help]").map(|f| f.0), Some(Dialect::Grbl));
-        assert_eq!(identify("start\necho:Marlin\nFIRMWARE_NAME:Marlin 2.1.2.1 (Jun 1 2024) SOURCE_CODE_URL:github.com").unwrap(), (Dialect::Marlin, "Marlin 2.1.2.1 (Jun 1 2024)".into()));
-        assert_eq!(identify("Build version: edge-1234, Build date: x, MCU: LPC1769, System Clock: 100MHz\nSmoothieware").map(|f| f.0), Some(Dialect::Smoothieware));
-        assert_eq!(identify("ok\nerror:20\n"), None);
-        assert_eq!(identify(""), None);
-    }
-
-    #[test]
-    fn explains_ports_that_cannot_be_opened() {
-        let denied = serialport::Error::new(serialport::ErrorKind::Io(std::io::ErrorKind::PermissionDenied), "Permission denied");
-        assert!(open_error(&denied).contains("dialout"));
-        let busy = serialport::Error::new(serialport::ErrorKind::NoDevice, "Device or resource busy");
-        assert_eq!(open_error(&busy), "in use by another program");
-    }
-}

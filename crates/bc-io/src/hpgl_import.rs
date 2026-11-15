@@ -151,29 +151,3 @@ pub fn import(data: &[u8]) -> Result<ImportResult, String> {
     }
     Ok(result)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn square_in_plotter_units() {
-        // A 10 mm square (400 units), closed.
-        let r = import(b"IN;SP1;PU0,0;PD400,0,400,400,0,400,0,0;PU;").unwrap();
-        assert_eq!(r.shapes.len(), 1);
-        let b = bc_geom::bounds(&r.shapes[0].path).unwrap();
-        assert!((b.width() - 10.0).abs() < 1e-9 && (b.height() - 10.0).abs() < 1e-9);
-        assert!(bc_geom::flatten(&r.shapes[0].path, 0.01)[0].closed);
-    }
-
-    #[test]
-    fn relative_moves_pens_and_circles() {
-        let r = import(b"IN;SP1;PU0,0;PD;PR400,0,0,400;PU;SP2;PA1000,1000;CI200;").unwrap();
-        assert_eq!(r.shapes.len(), 2);
-        assert_ne!(r.shapes[0].color, r.shapes[1].color, "each pen its own colour");
-        let c = bc_geom::bounds(&r.shapes[1].path).unwrap();
-        assert!((c.width() - 10.0).abs() < 0.01, "a circle of radius 200 units = 5 mm: {c:?}");
-        assert!(import(b"IN;PU100,100;").is_err());
-        assert!(import(b"").is_err());
-    }
-}

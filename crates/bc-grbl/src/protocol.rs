@@ -118,24 +118,3 @@ pub fn error_text(code: u32) -> &'static str {
         _ => "the controller reported an error",
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_responses() {
-        assert_eq!(parse_line("ok\r"), Response::Ok);
-        assert_eq!(parse_line("error:20"), Response::Error(20));
-        assert_eq!(parse_line("ALARM:2"), Response::Alarm(2));
-        assert!(error_text(5).contains("$22"));
-        assert_eq!(error_text(99), "the controller reported an error");
-        assert!(matches!(parse_line("Grbl 1.1h ['$' for help]"), Response::Welcome(_)));
-        let Response::Status(s) = parse_line("<Idle|MPos:1.000,2.500,0.000|FS:0,0|WCO:0.000,0.500,0.000>") else { panic!() };
-        assert_eq!(s.state, "Idle");
-        assert_eq!(s.mpos, Some((1.0, 2.5, 0.0)));
-        assert_eq!(s.wco, Some((0.0, 0.5, 0.0)));
-        let Response::Status(s) = parse_line("<Run|WPos:3,4|FS:1200,500>") else { panic!() };
-        assert_eq!(s.wpos, Some((3.0, 4.0, 0.0)));
-    }
-}

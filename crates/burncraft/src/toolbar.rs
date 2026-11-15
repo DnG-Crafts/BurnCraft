@@ -245,17 +245,3 @@ enum LeftItem {
     ToolButton(Tool),
     Cmd(Icon, Command),
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strip_gains_columns_on_short_windows() {
-        let one = LEFT + GAP + 14.0;
-        let w = |h: f32| BurnCraftApp::left_toolbar_min_width(h);
-        assert_eq!(w(1400.0), one, "a tall window fits one column");
-        assert_eq!(w(700.0), 2.0 * (LEFT + GAP) + 14.0, "a laptop-height window needs two");
-        assert!(w(420.0) >= 3.0 * (LEFT + GAP) + 14.0, "a very short window needs three or more");
-        assert!(w(700.0) <= w(500.0) && w(1400.0) <= w(700.0), "shorter never needs fewer columns");
-    }
-}

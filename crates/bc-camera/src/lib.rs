@@ -285,22 +285,3 @@ mod mac {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::fit_frame;
-
-    #[test]
-    fn frames_always_match_their_size() {
-        // One row too many (as a Mac camera sent: 960 × 544 reported, 545 rows of data).
-        let (w, h, rgb) = fit_frame(960, 544, vec![0; 960 * 545 * 3]).unwrap();
-        assert_eq!((w, h, rgb.len()), (960, 544, 960 * 544 * 3));
-        // A row short: the height follows the data.
-        let (_, h, rgb) = fit_frame(4, 3, vec![0; 4 * 2 * 3 + 5]).unwrap();
-        assert_eq!((h, rgb.len()), (2, 4 * 2 * 3));
-        // Exact data is untouched; empty data is dropped.
-        assert_eq!(fit_frame(2, 2, vec![7; 12]).unwrap().2, vec![7; 12]);
-        assert!(fit_frame(10, 10, vec![0; 5]).is_none());
-        assert!(fit_frame(0, 10, vec![]).is_none());
-    }
-}

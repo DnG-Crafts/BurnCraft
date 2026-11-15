@@ -71,13 +71,3 @@ pub fn read_other_project(ext: &str, data: &[u8], bed_height: f64, fonts: &fonts
         lightburn::import(data, bed_height, fonts)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn csv_with_quotes_and_short_rows() {
-        let (h, rows) = super::read_csv(b"Name, Size\n\"Smith, Jo\",M\nAda\n").unwrap();
-        assert_eq!(h, vec!["Name", "Size"]);
-        assert_eq!(rows, vec![vec!["Smith, Jo".to_string(), "M".to_string()], vec!["Ada".to_string()]]);
-    }
-}

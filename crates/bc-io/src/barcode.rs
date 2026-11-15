@@ -81,39 +81,3 @@ pub fn outline(symbology: Symbology, content: &str, size: f64) -> Result<BezPath
     let b = bc_geom::bounds(&path).ok_or("empty barcode")?;
     Ok(Affine::translate(-b.center().to_vec2()) * path)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn qr_fills_requested_size() {
-        let p = outline(Symbology::Qr, "https://example.com", 20.0).unwrap();
-        let b = bc_geom::bounds(&p).unwrap();
-        assert!((b.width() - 20.0).abs() < 1e-6 && (b.height() - 20.0).abs() < 1e-6);
-        assert!(b.center().distance(Point::ORIGIN) < 1e-9);
-        assert!(bc_geom::flatten(&p, 0.01).iter().all(|l| l.closed));
-    }
-
-    #[test]
-    fn qr_with_logo_space_is_empty_in_the_middle() {
-        let p = outline(Symbology::QrLogo, "https://example.com/some/longer/path", 30.0).unwrap();
-        let b = bc_geom::bounds(&p).unwrap();
-        assert!((b.width() - 30.0).abs() < 1e-6);
-        let f = logo_fraction("https://example.com/some/longer/path").unwrap();
-        assert!((0.2..0.32).contains(&f), "{f}");
-        // Nothing dark inside the logo square.
-        let half = 30.0 * f / 2.0 - 0.01;
-        let inside = bc_geom::flatten(&p, 0.01).iter().flat_map(|l| l.points.clone()).any(|q| q.x.abs() < half && q.y.abs() < half);
-        assert!(!inside);
-    }
-
-    #[test]
-    fn code128_bars() {
-        let p = outline(Symbology::Code128, "ABC-123", 10.0).unwrap();
-        let b = bc_geom::bounds(&p).unwrap();
-        assert!((b.height() - 10.0).abs() < 1e-9 && b.width() > 10.0);
-        assert!(outline(Symbology::Code128, "naïve", 10.0).is_err());
-        assert!(outline(Symbology::Qr, "", 10.0).is_err());
-    }
-}

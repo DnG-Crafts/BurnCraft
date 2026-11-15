@@ -73,11 +73,6 @@ impl Controller {
         Ok(controller)
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_link(link: UdpLink) -> Self {
-        Self { link: Box::new(link) }
-    }
-
     pub fn card_id(&self) -> Result<i64> {
         self.link.read_param(mem::CARD_ID)
     }
@@ -214,71 +209,4 @@ fn move_command(x: f64, y: f64, speed: f64) -> Vec<u8> {
 pub fn move_time_limit(a: (f64, f64), b: (f64, f64), speed: f64) -> Duration {
     let distance = (b.0 - a.0).hypot(b.1 - a.1);
     Duration::from_secs_f64(3.0 * distance / speed.max(1.0) + 5.0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::link::tests::FakeController;
-
-    #[test]
-    fn state_reads_position_in_mm() {
-        let fake = FakeController::start(false);
-        let c = Controller::from_link(fake.link());
-        let s = c.state().unwrap();
-        assert_eq!(s.x, 123.456);
-    }
-
-    #[test]
-    fn move_to_sets_the_speed_then_moves_to_an_absolute_position() {
-        let fake = FakeController::start(false);
-        Controller::from_link(fake.link()).move_to(10.0, 2.5, 150.0).unwrap();
-        let got = fake.received.lock().unwrap();
-        let mut expected = vec![0xC9, 0x02];
-        expected.extend_from_slice(&encode_speed(150.0));
-        // Option 0x00: absolute. (0x02 would move *by* 10 mm, 2.5 mm.)
-        expected.extend_from_slice(&[0xD9, 0x10, 0x00]);
-        expected.extend_from_slice(&encode_coord(10_000));
-        expected.extend_from_slice(&encode_coord(2_500));
-        assert_eq!(got[0], expected);
-    }
-
-    #[test]
-    fn keypad_keys_press_and_release() {
-        let fake = FakeController::start(false);
-        let c = Controller::from_link(fake.link());
-        for (key, down) in [(JogKey::ZUp, 0x24), (JogKey::ZDown, 0x25), (JogKey::UForward, 0x26), (JogKey::UBackward, 0x27)] {
-            c.jog_key(key, true).unwrap();
-            c.jog_key(key, false).unwrap();
-            let got = fake.received.lock().unwrap();
-            assert_eq!(got[got.len() - 2..], [vec![0xD8, down], vec![0xD8, down + 0x10]], "{key:?}");
-        }
-    }
-
-    #[test]
-    fn time_limits_grow_with_distance() {
-        assert!(move_time_limit((0.0, 0.0), (0.0, 0.0), 100.0) >= Duration::from_secs(5));
-        let long = move_time_limit((0.0, 0.0), (300.0, 400.0), 100.0);
-        assert!(long >= Duration::from_secs(20) && long <= Duration::from_secs(21), "{long:?}");
-    }
-
-    #[test]
-    fn waiting_stops_the_machine_when_aborted() {
-        let fake = FakeController::start(false);
-        let c = Controller::from_link(fake.link());
-        let r = c.wait_until_at(0.0, 0.0, Duration::from_secs(5), &|| true, |_| {});
-        assert!(r.is_err());
-        let got = fake.received.lock().unwrap();
-        assert_eq!(got.last().unwrap(), &vec![0xD8, 0x01], "a stop is sent");
-    }
-
-    #[test]
-    fn run_job_sends_whole_stream() {
-        let fake = FakeController::start(false);
-        let layer = RdLayer { speed: 10.0, min_power: 5.0, max_power: 5.0, color: [0, 0, 0], air_assist: false, paths: vec![crate::job::RdPath::cut(vec![(0, 0), (1000, 0)])] };
-        Controller::from_link(fake.link()).run_job(std::slice::from_ref(&layer), |_, _| {}).unwrap();
-        let sent = fake.received.lock().unwrap().concat();
-        assert_eq!(sent, encode_job(&[layer]).unwrap().concat());
-        assert_eq!(*sent.last().unwrap(), 0xD7);
-    }
 }

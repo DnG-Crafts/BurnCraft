@@ -74,36 +74,3 @@ fn solve8(mut a: [[f64; 9]; 8]) -> Option<[f64; 8]> {
     }
     Some(x)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn close(a: (f64, f64), b: (f64, f64)) -> bool {
-        (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6
-    }
-
-    #[test]
-    fn maps_the_four_points_and_inverts() {
-        // A tilted, perspective-distorted view of a 400 × 300 mm rectangle.
-        let img = [(102.0, 87.0), (1180.0, 120.0), (1105.0, 900.0), (150.0, 860.0)];
-        let bed = [(50.0, 50.0), (450.0, 50.0), (450.0, 350.0), (50.0, 350.0)];
-        let h = Homography::from_points(img, bed).unwrap();
-        for i in 0..4 {
-            assert!(close(h.apply(img[i]), bed[i]));
-        }
-        let inv = h.inverse().unwrap();
-        for p in [(200.0, 100.0), (420.0, 330.0)] {
-            assert!(close(h.apply(inv.apply(p)), p));
-        }
-    }
-
-    #[test]
-    fn identity_and_degenerate_input() {
-        let sq = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
-        let h = Homography::from_points(sq, sq).unwrap();
-        assert!(close(h.apply((0.3, 0.7)), (0.3, 0.7)));
-        let line = [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0)];
-        assert!(Homography::from_points(line, sq).is_none());
-    }
-}

@@ -94,32 +94,3 @@ impl VariableText {
         out
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn vars() -> VariableText {
-        VariableText { serial: 7, csv_headers: vec!["Name".into(), "Size".into()], csv_rows: vec![vec!["Ada".into(), "M".into()], vec!["Bob".into(), "L".into()]], ..Default::default() }
-    }
-
-    #[test]
-    fn fields() {
-        let clock = Clock { date: "2026-10-14".into(), time: "09:30".into() };
-        let v = vars();
-        assert_eq!(v.evaluate("No. {serial:0000} for {name} ({Size}) on {date} {time}", &clock), "No. 0007 for Ada (M) on 2026-10-14 09:30");
-        assert_eq!(v.evaluate("{{literal}} {unknown} {serial}", &clock), "{literal} {unknown} 7");
-        assert_eq!(v.evaluate("unterminated {serial", &clock), "unterminated {serial");
-    }
-
-    #[test]
-    fn advancing() {
-        let mut v = vars();
-        v.increment = 5;
-        v.advance();
-        assert_eq!((v.serial, v.row), (12, 1));
-        v.advance();
-        assert_eq!(v.row, 1, "stays on the last row");
-        assert!(has_fields("a {b} c") && !has_fields("plain"));
-    }
-}

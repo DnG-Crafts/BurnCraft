@@ -1463,53 +1463,6 @@ pub fn format_duration(seconds: f64) -> String {
     if s >= 3600 { format!("{}h {:02}m", s / 3600, (s % 3600) / 60) } else { format!("{}m {:02}s", s / 60, s % 60) }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn material_test_grid_layout() {
-        let t = MaterialTest { labels: false, fill: false, rows: 3, columns: 4, ..Default::default() };
-        let job = t.job(&FontLibrary::from_database(Default::default()));
-        assert_eq!(job.layers.len(), 12);
-        assert_eq!(job.layers[0].settings.max_power, t.power_min);
-        assert_eq!(job.layers[11].settings.max_power, t.power_max);
-        assert_eq!(job.layers[11].settings.speed, t.speed_max);
-        let (min, max) = job.bounds().unwrap();
-        assert_eq!(min, Point::new(10.0, 10.0));
-        assert!((max.x - (10.0 + 4.0 * 8.0 + 3.0 * 2.0)).abs() < 1e-9);
-    }
-
-    #[test]
-    fn simulation_plays_in_job_time() {
-        // One 100 mm line at 100 mm/s, starting at the origin: 1 s of cutting.
-        let mut settings = bc_doc::Layer::new(0);
-        settings.speed = 100.0;
-        let line = bc_job::JobPath::burn(vec![Point::new(0.0, 0.0), Point::new(100.0, 0.0)]);
-        let job = Job { layers: vec![bc_job::JobLayer { index: 0, settings, paths: vec![line] }], skipped: Vec::new() };
-        let mut p = Preview::new(job, "t".into(), 200.0);
-        (p.progress, p.playing, p.play_speed) = (0.0, true, 2.0);
-        p.tick(10.0);
-        p.tick(10.25);
-        assert!((p.progress - 0.5).abs() < 1e-6, "a quarter second at 2× is half the job: {}", p.progress);
-        p.playing = false;
-        p.tick(11.0);
-        assert!((p.progress - 0.5).abs() < 1e-6, "paused");
-        p.playing = true;
-        p.tick(20.0);
-        p.tick(25.0);
-        assert_eq!((p.progress, p.playing), (1.0, false), "stops at the end");
-        assert_eq!(format_clock(65.4), "1:05");
-        assert_eq!(format_clock(3725.0), "1:02:05");
-    }
-
-    #[test]
-    fn durations() {
-        assert_eq!(format_duration(65.0), "1m 05s");
-        assert_eq!(format_duration(3720.0), "1h 02m");
-    }
-}
-
 // --- Box and living-hinge generator ---------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]

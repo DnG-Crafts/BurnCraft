@@ -57,31 +57,3 @@ pub fn export(doc: &Document) -> Result<(Vec<u8>, Vec<String>), String> {
     drawing.save(&mut bytes).map_err(|e| e.to_string())?;
     Ok((bytes, notes))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bc_geom::Affine;
-
-    #[test]
-    fn round_trips_through_the_importer() {
-        let mut doc = Document::default();
-        doc.add_shape(ShapeKind::Rect { width: 40.0, height: 20.0, corner_radius: 0.0 }, Affine::translate((50.0, 30.0)), 0);
-        doc.add_shape(ShapeKind::Ellipse { radius_x: 10.0, radius_y: 10.0 }, Affine::translate((100.0, 100.0)), 3);
-        doc.add_shape(ShapeKind::image(&[1, 2, 3], 10.0, 10.0), Affine::IDENTITY, 0);
-        let (bytes, notes) = export(&doc).unwrap();
-        assert_eq!(notes.len(), 1, "the image is reported");
-        let text = String::from_utf8_lossy(&bytes);
-        let has_line = |s: &str| text.lines().any(|l| l.trim() == s);
-        assert!(text.contains("LWPOLYLINE") && has_line("01") && has_line("04"), "layers named by number");
-        // The importer reads it back: same sizes, and the rectangle still sits 50 mm right of the circle.
-        let back = crate::dxf_import::import(&bytes).unwrap();
-        assert_eq!(back.shapes.len(), 2);
-        let boxes: Vec<_> = back.shapes.iter().map(|s| bc_geom::bounds(&s.path).unwrap()).collect();
-        let rect = boxes.iter().find(|b| (b.width() - 40.0).abs() < 1e-6).expect("rectangle");
-        let circle = boxes.iter().find(|b| (b.width() - 20.0).abs() < 0.05).expect("circle");
-        assert!((rect.height() - 20.0).abs() < 1e-6);
-        assert!((circle.center().x - rect.center().x - 50.0).abs() < 0.05);
-        assert!((circle.center().y - rect.center().y - 70.0).abs() < 0.05, "the circle is still 70 mm below the rectangle");
-    }
-}

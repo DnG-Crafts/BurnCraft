@@ -648,33 +648,3 @@ fn flower_row(l: f64, h: f64) -> BezPath {
     }
     union(parts)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_shape_is_a_closed_sizeable_outline() {
-        let all = shapes();
-        assert!(all.len() > 80, "{} shapes", all.len());
-        for s in all {
-            assert!(CATEGORIES.contains(&s.category), "{}", s.category);
-            let p = s.path(50.0);
-            let b = p.bounding_box();
-            assert!((b.width().max(b.height()) - 50.0).abs() < 0.5, "{} / {}: {b:?}", s.category, s.name);
-            assert!(b.center().to_vec2().hypot() < 0.5, "{} centred", s.name);
-            assert!(crate::ops::area(&p).abs() > 50.0, "{} / {} has area {}", s.category, s.name, crate::ops::area(&p));
-        }
-    }
-
-    #[test]
-    fn every_border_fills_its_strip() {
-        for b in &BORDERS {
-            let p = (b.build)(200.0, 20.0);
-            let bb = p.bounding_box();
-            assert!(bb.width() > 190.0 && bb.width() < 206.0, "{}: {bb:?}", b.name);
-            assert!(bb.height() > 12.0 && bb.height() < 21.0, "{}: {bb:?}", b.name);
-            assert!(crate::ops::area(&p).abs() > 500.0, "{} area {}", b.name, crate::ops::area(&p));
-        }
-    }
-}

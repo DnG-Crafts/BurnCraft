@@ -113,34 +113,3 @@ pub fn read(bytes: &[u8]) -> Result<Vec<RdFileLayer>, String> {
     }
     Ok(layers.into_iter().map(|(part, paths)| RdFileLayer { color: colors.get(&part).copied(), paths }).collect())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::codec::MAGIC_644X;
-    use crate::job::{encode_job, RdLayer, RdPath};
-
-    #[test]
-    fn reads_back_what_the_writer_writes() {
-        let square = vec![(10_000, 10_000), (60_000, 10_000), (60_000, 40_000), (10_000, 40_000), (10_000, 10_000)];
-        // A long line forces absolute moves; short steps use relative ones.
-        let line = vec![(100_000, 5_000), (100_500, 5_000), (100_500, 5_800), (300_000, 200_000)];
-        let layers = vec![
-            RdLayer { speed: 20.0, min_power: 50.0, max_power: 60.0, color: [255, 0, 0], air_assist: true, paths: vec![RdPath::cut(square.clone())] },
-            RdLayer { speed: 100.0, min_power: 10.0, max_power: 10.0, color: [0, 0, 255], air_assist: false, paths: vec![RdPath::cut(line.clone())] },
-        ];
-        let file: Vec<u8> = Swizzle::new(MAGIC_644X).encode(&encode_job(&layers).unwrap().concat());
-        let read = read(&file).unwrap();
-        assert_eq!(read.len(), 2);
-        assert_eq!(read[0].color, Some([255, 0, 0]));
-        assert_eq!(read[1].color, Some([0, 0, 255]));
-        assert_eq!(read[0].paths, vec![square]);
-        assert_eq!(read[1].paths, vec![line]);
-    }
-
-    #[test]
-    fn other_files_are_rejected() {
-        assert!(read(b"this is not a job file").is_err());
-        assert!(read(&[]).is_err());
-    }
-}

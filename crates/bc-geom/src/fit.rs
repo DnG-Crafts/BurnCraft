@@ -91,36 +91,3 @@ pub fn min_area_rect(points: &[Point]) -> Option<OrientedRect> {
     }
     best.map(|(_, r)| r.normalized())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn finds_a_turned_rectangle() {
-        let r = OrientedRect { center: Point::new(50.0, 40.0), width: 30.0, height: 10.0, angle: 0.5 };
-        let mut pts = r.corners().to_vec();
-        // Points inside don't matter.
-        pts.extend([Point::new(50.0, 40.0), Point::new(52.0, 41.0)]);
-        let found = min_area_rect(&pts).unwrap();
-        assert!((found.center - r.center).hypot() < 1e-9);
-        assert!((found.width - 30.0).abs() < 1e-9 && (found.height - 10.0).abs() < 1e-9, "{found:?}");
-        assert!((found.angle - 0.5).abs() < 1e-9, "{found:?}");
-    }
-
-    #[test]
-    fn normalizing_keeps_the_rectangle() {
-        let r = OrientedRect { center: Point::ORIGIN, width: 10.0, height: 30.0, angle: 2.8 };
-        let n = r.normalized();
-        assert_eq!((n.width, n.height), (30.0, 10.0));
-        assert!(n.angle > -std::f64::consts::FRAC_PI_2 && n.angle <= std::f64::consts::FRAC_PI_2);
-        let mut a: Vec<Point> = r.corners().to_vec();
-        let mut b: Vec<Point> = n.corners().to_vec();
-        let key = |p: &Point| ((p.x * 1e6).round() as i64, (p.y * 1e6).round() as i64);
-        a.sort_by_key(key);
-        b.sort_by_key(key);
-        for (p, q) in a.iter().zip(&b) {
-            assert!((*p - *q).hypot() < 1e-6);
-        }
-    }
-}

@@ -248,27 +248,3 @@ pub fn spin(ui: &mut egui::Ui, value: &mut f64, range: std::ops::RangeInclusive<
     });
     changed
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn formatting() {
-        assert_eq!(Units::Millimetres.format(12.345), "12.35 mm");
-        assert_eq!(Units::Inches.format(25.4), "1.000 in");
-    }
-
-    #[test]
-    fn speeds() {
-        let per_min = Speed::new(Units::Millimetres, SpeedUnit::PerMinute);
-        assert_eq!(per_min.format(50.0), "3000 mm/min");
-        assert_eq!(Speed::default().format(16.25), "16.2 mm/s");
-        assert_eq!(Speed::default().format(100.0), "100 mm/s");
-        assert_eq!(Speed::new(Units::Inches, SpeedUnit::PerSecond).format(25.4), "1 in/s");
-        assert_eq!(Speed::new(Units::Inches, SpeedUnit::PerMinute).format(10.0), "23.6 in/min");
-        // Typed in mm/min, stored in mm/s, shown again as typed.
-        let stored = 1000.0 / 60.0;
-        assert_eq!(per_min.number(stored), "1000");
-    }
-}

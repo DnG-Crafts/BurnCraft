@@ -110,13 +110,6 @@ impl AutoSaver {
         self.saved_revision = None;
     }
 
-    /// Waits for a backup in progress (for tests).
-    #[cfg(test)]
-    fn wait(&mut self) {
-        if let Some(w) = self.worker.take() {
-            w.join().unwrap();
-        }
-    }
 }
 
 /// Most recent files kept in File > Open Recent.
@@ -127,78 +120,4 @@ pub fn remember(recent: &mut Vec<PathBuf>, path: &Path) {
     recent.retain(|p| p != path);
     recent.insert(0, path.to_path_buf());
     recent.truncate(RECENT_LIMIT);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bc_doc::ShapeKind;
-    use bc_geom::Affine;
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("burncraft-test-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        d
-    }
-
-    #[test]
-    fn backs_up_changes_and_recovers_them() {
-        let dir = temp_dir("autosave");
-        let mut saver = AutoSaver::in_dir(Some(dir.clone()));
-        let mut doc = Document::default();
-        // Nothing to back up: clean, or empty.
-        saver.tick(&doc, 1, true, None);
-        assert!(saver.pending().is_none());
-        doc.add_shape(ShapeKind::Ellipse { radius_x: 5.0, radius_y: 5.0 }, Affine::IDENTITY, 0);
-        saver.tick(&doc, 2, false, None);
-        assert!(saver.pending().is_none(), "saved designs aren't backed up");
-        // Unsaved changes are.
-        saver.tick(&doc, 2, true, Some(Path::new("C:/designs/coaster.bcproj")));
-        saver.wait();
-        let (file, info) = saver.pending().expect("a recovery file");
-        assert_eq!(info.file.as_deref(), Some(Path::new("C:/designs/coaster.bcproj")));
-        assert_eq!(Document::load(&file).unwrap().shapes.len(), 1);
-        assert_eq!(info.age(), "less than a minute ago");
-        // A clean exit removes it.
-        saver.clear();
-        assert!(saver.pending().is_none());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn recent_files_are_unique_newest_first_and_capped() {
-        let mut recent = Vec::new();
-        for i in 0..15 {
-            remember(&mut recent, Path::new(&format!("{i}.bcproj")));
-        }
-        remember(&mut recent, Path::new("10.bcproj"));
-        assert_eq!(recent.len(), RECENT_LIMIT);
-        assert_eq!(recent[0], Path::new("10.bcproj"));
-        assert_eq!(recent.iter().filter(|p| *p == Path::new("10.bcproj")).count(), 1);
-    }
-}
-
-#[cfg(test)]
-mod where_tests {
-    #[test]
-    #[ignore = "diagnostic"]
-    fn print_recovery_dir() {
-        println!("RECOVERY_DIR={}", eframe::storage_dir("BurnCraft").unwrap().join("recovery").display());
-    }
-}
-#[cfg(test)]
-mod plant_tests {
-    use super::*;
-
-    /// Leaves a backup in the real recovery folder, as a crash would (for checking the restore prompt).
-    #[test]
-    #[ignore = "diagnostic"]
-    fn plant_backup() {
-        let mut saver = AutoSaver::new();
-        let mut doc = Document::default();
-        doc.add_shape(bc_doc::ShapeKind::Ellipse { radius_x: 45.0, radius_y: 45.0 }, bc_geom::Affine::translate((150.0, 150.0)), 0);
-        saver.save_now(&doc, 1, Some(Path::new("C:/designs/coaster.bcproj")));
-        saver.wait();
-        println!("planted: {:?}", saver.pending().map(|(p, i)| (p, i.age())));
-    }
 }

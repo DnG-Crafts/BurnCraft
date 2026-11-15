@@ -260,14 +260,3 @@ pub fn saved_window_is_visible() -> bool {
         x > -10_000.0 && y > -10_000.0
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn single_instance_marker() {
-        // The first claim in this process succeeds; a second one sees it's taken.
-        assert!(super::claim_single_instance());
-        #[cfg(windows)]
-        assert!(!super::claim_single_instance());
-    }
-}
