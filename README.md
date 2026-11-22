@@ -191,7 +191,8 @@ If you run BurnCraft on any of the untested controllers, a report of how it went
 - **Macros:** one-click buttons that send your own G-code, for example LaserPecker's red-dot and electric-stand commands.
 - **Rotary** (Laser → Rotary Setup, Ctrl+Shift+R):
   - Roller or chuck rotaries that replace the Y axis; jobs and framing are scaled so the design wraps the object at true size.
-  - A-axis output for 4-axis GRBL boards.
+  - On GRBL, the rotary can use the A output (4-axis boards) or the Z output instead of Y.
+  - The object's size as a diameter or a circumference (each updates the other).
   - "Rotate once" for calibration, plus a warning when a design is taller than the object's circumference.
   - Not available for galvos yet.
 - **Remote monitoring** (Settings → Remote monitoring): a page for any phone or computer on your network.
@@ -285,6 +286,14 @@ sh scripts/macos-app.sh
 
 It builds BurnCraft and puts the app in `target/release/BurnCraft.app`. Drag it to Applications. The first time it uses the camera, macOS asks whether **BurnCraft** may use it.
 
+**Linux menu entry:** to open BurnCraft from the applications menu, with its own icon in the dock or task bar (Wayland included), run:
+
+```bash
+sh scripts/linux-install.sh
+```
+
+It builds BurnCraft and installs it for you only (under `~/.local`): the program, a menu entry and the icon. `sh scripts/linux-install.sh --remove` takes them out again; your settings are kept.
+
 ### Platform notes
 
 | | Windows | macOS | Linux |
@@ -298,7 +307,7 @@ Find My Laser, file import and the camera have been checked on all three. Galvo 
 
 ## Connecting your laser
 
-Open **Devices** in the Laser panel (or from the toolbar) and add your machine: **Find My Laser** finds lasers plugged in by USB (GRBL, Marlin, Smoothieware, Ruida) and sets the port and baud rate; **Create Manually** walks through controller, connection, size and origin step by step. Select the machine in the list, then click **Connect**.
+Open **Devices** in the Laser panel (or from the toolbar) and add your machine: **Find My Laser** finds lasers plugged in by USB (GRBL, Marlin, Smoothieware, Ruida) and sets the port and baud rate; **Create Manually** walks through controller, connection, size and origin step by step. For GRBL, both read the work area from the controller (`$130` x `$131`): Find My Laser by itself, Create Manually with **Read from machine**. Select the machine in the list, then click **Connect**.
 
 <details>
 <summary><b>Ruida (most CO2 lasers)</b></summary>

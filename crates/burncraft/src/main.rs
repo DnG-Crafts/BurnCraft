@@ -76,12 +76,18 @@ fn options(renderer: eframe::Renderer, persist_window: bool, software_ok: bool) 
     eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("BurnCraft")
+            // Linux desktops (Wayland in particular) find the window's icon by this id, which
+            // names the menu entry scripts/linux-install.sh installs.
+            .with_app_id("org.burncraft.BurnCraft")
             .with_icon(icon)
             .with_inner_size([1500.0, 950.0])
             .with_min_inner_size([1000.0, 650.0])
             .with_drag_and_drop(true),
         renderer,
         persist_window,
+        // Settings stay in the folder named after "BurnCraft". Without this, eframe would name it
+        // after the app id above and every machine and preference would seem to be lost.
+        persistence_path: eframe::storage_dir("BurnCraft").map(|d| d.join("app.ron")),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(eframe::egui_wgpu::WgpuSetupCreateNew {
                 native_adapter_selector: selector,

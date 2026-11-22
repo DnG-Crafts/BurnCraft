@@ -33,7 +33,7 @@ pub enum LaserTab {
     History,
 }
 
-fn swatch(ui: &mut egui::Ui, index: usize, rgb: [u8; 3], size: f32) -> egui::Response {
+pub(crate) fn swatch(ui: &mut egui::Ui, index: usize, rgb: [u8; 3], size: f32) -> egui::Response {
     faded_swatch(ui, index, rgb, size, 1.0)
 }
 

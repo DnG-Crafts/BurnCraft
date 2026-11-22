@@ -40,6 +40,9 @@ pub struct Wizard {
     /// The result of "Check connection" (running while the receiver is set).
     check: Option<mpsc::Receiver<Result<String, String>>>,
     check_result: Option<Result<String, String>>,
+    /// GRBL: "Read from machine" (running while the receiver is set) and what it said.
+    reading: Option<mpsc::Receiver<Result<(f64, f64), String>>>,
+    read_note: Option<Result<String, String>>,
 }
 
 /// What the wizard asks of the Devices window this frame.
@@ -51,7 +54,7 @@ pub enum WizardOutcome {
 
 impl Wizard {
     pub fn new() -> Self {
-        let mut w = Self { step: Step::Controller, choice: 0, settings: LaserSettings::default(), name: String::new(), check: None, check_result: None };
+        let mut w = Self { step: Step::Controller, choice: 0, settings: LaserSettings::default(), name: String::new(), check: None, check_result: None, reading: None, read_note: None };
         w.apply_choice();
         w
     }
@@ -123,7 +126,16 @@ impl Wizard {
             self.check_result = Some(r);
             self.check = None;
         }
-        if self.check.is_some() {
+        if let Some(rx) = &self.reading
+            && let Ok(r) = rx.try_recv()
+        {
+            self.read_note = Some(r.map(|(w, h)| {
+                self.settings.bed = (w, h);
+                format!("The controller reports {} × {}", units.format(w), units.format(h))
+            }));
+            self.reading = None;
+        }
+        if self.check.is_some() || self.reading.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         let mut outcome = WizardOutcome::Open;
@@ -165,8 +177,37 @@ impl Wizard {
                                 units.drag(ui, &mut self.settings.bed.0, 10.0..=5000.0);
                                 ui.label("×");
                                 units.drag(ui, &mut self.settings.bed.1, 10.0..=5000.0);
+                                if self.settings.controller == ControllerKind::Grbl {
+                                    let port = self.settings.serial_port.clone();
+                                    let tip = if port.is_empty() { "Choose the serial port first (previous step)" } else { "Ask the controller for its travel ($130 × $131)" };
+                                    if ui.add_enabled(!port.is_empty() && self.reading.is_none(), egui::Button::new("Read from machine")).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
+                                        let baud = self.settings.baud;
+                                        let (tx, rx) = mpsc::channel();
+                                        std::thread::spawn(move || {
+                                            let _ = tx.send(bc_grbl::probe::read_travel(&port, baud));
+                                        });
+                                        self.reading = Some(rx);
+                                        self.read_note = None;
+                                    }
+                                    if self.reading.is_some() {
+                                        ui.spinner();
+                                    }
+                                }
                             });
                             ui.end_row();
+                            match &self.read_note {
+                                Some(Ok(m)) => {
+                                    ui.label("");
+                                    ui.colored_label(egui::Color32::from_rgb(60, 170, 80), m);
+                                    ui.end_row();
+                                }
+                                Some(Err(m)) => {
+                                    ui.label("");
+                                    ui.colored_label(ui.visuals().warn_fg_color, format!("Couldn't read it: {m}"));
+                                    ui.end_row();
+                                }
+                                None => {}
+                            }
                         }
                         if self.settings.controller == ControllerKind::Lp2 {
                             return;
@@ -186,7 +227,7 @@ impl Wizard {
                     ui.weak(match self.settings.controller {
                         ControllerKind::Galvo => "The size of the square the lens can mark, as printed on the lens (e.g. 110 mm).",
                         ControllerKind::Ruida => "Width × height the head can travel. A Ruida reports its own size when it connects.",
-                        ControllerKind::Grbl => "Width × height the head can travel (GRBL: $130 × $131).",
+                        ControllerKind::Grbl => "Width × height the head can travel (GRBL: $130 × $131). Read from machine asks the controller, which must not be connected in BurnCraft at the time.",
                         ControllerKind::Lp2 => "Speeds are set as depth (1-100 %), as in the LaserPecker app: deeper is slower.",
                     });
                 }
@@ -396,6 +437,8 @@ pub struct Found {
     pub ruida_model: RuidaModel,
     /// What the controller called itself.
     pub info: String,
+    /// The work area it reported (GRBL's `$130` x `$131`), if any.
+    pub bed: Option<(f64, f64)>,
 }
 
 impl Found {
@@ -410,7 +453,7 @@ impl Found {
         } else if self.controller == ControllerKind::Lp2 {
             s.bed = bc_lp2::FIELD;
         } else {
-            s.bed = (400.0, 400.0);
+            s.bed = self.bed.unwrap_or((400.0, 400.0));
         }
         let name = match self.controller {
             ControllerKind::Ruida => "Ruida (USB)".to_string(),
@@ -475,13 +518,13 @@ impl Finder {
                 }
                 // The LaserPecker 2 (CH340) answers binary frames, not G-code.
                 if p.is_ch340() && bc_lp2::Controller::probe(&p.name).unwrap_or(false) {
-                    let found = Found { port: p.name.clone(), controller: ControllerKind::Lp2, dialect: Dialect::Grbl, baud: bc_lp2::BAUD, ruida_model: RuidaModel::default(), info: "LaserPecker 2".into() };
+                    let found = Found { port: p.name.clone(), controller: ControllerKind::Lp2, dialect: Dialect::Grbl, baud: bc_lp2::BAUD, ruida_model: RuidaModel::default(), info: "LaserPecker 2".into(), bed: None };
                     let _ = tx.send(ScanEvent::Found(found));
                     continue;
                 }
                 match bc_grbl::probe::probe(&p.name) {
                     Ok(Some(f)) => {
-                        let _ = tx.send(ScanEvent::Found(Found { port: f.port, controller: ControllerKind::Grbl, dialect: f.dialect, baud: f.baud, ruida_model: RuidaModel::default(), info: f.info }));
+                        let _ = tx.send(ScanEvent::Found(Found { port: f.port, controller: ControllerKind::Grbl, dialect: f.dialect, baud: f.baud, ruida_model: RuidaModel::default(), info: f.info, bed: f.travel }));
                     }
                     Ok(None) => {}
                     Err(why) => {
@@ -592,6 +635,6 @@ impl Finder {
 fn probe_ruida(port: &str) -> Option<Found> {
     RuidaModel::ALL.into_iter().find_map(|model| {
         let id = bc_ruida::Controller::connect_usb(port, model).ok()?.card_id().ok()?;
-        Some(Found { port: port.to_string(), controller: ControllerKind::Ruida, dialect: Dialect::Grbl, baud: 115_200, ruida_model: model, info: format!("Ruida {}", model.label().split(' ').next().unwrap_or("")).trim().to_string() + &format!(" (card {id:X})") })
+        Some(Found { port: port.to_string(), controller: ControllerKind::Ruida, dialect: Dialect::Grbl, baud: 115_200, ruida_model: model, info: format!("Ruida {}", model.label().split(' ').next().unwrap_or("")).trim().to_string() + &format!(" (card {id:X})"), bed: None })
     })
 }

@@ -241,7 +241,40 @@ pub enum RotaryKind {
     Chuck,
 }
 
-/// A rotary attachment in place of the Y axis (or on a 4th "A" axis).
+/// Which controller output (G-code axis) drives the rotary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum RotaryAxis {
+    /// Plugged in where the Y motor was.
+    #[default]
+    Y,
+    /// A 4th axis.
+    A,
+    /// The Z output (for a chuck wired there).
+    Z,
+}
+
+impl RotaryAxis {
+    pub const ALL: [RotaryAxis; 3] = [RotaryAxis::Y, RotaryAxis::A, RotaryAxis::Z];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RotaryAxis::Y => "Replaces Y",
+            RotaryAxis::A => "A axis (4th axis)",
+            RotaryAxis::Z => "Z axis",
+        }
+    }
+
+    /// The letter its moves are written with.
+    pub fn letter(self) -> char {
+        match self {
+            RotaryAxis::Y => 'Y',
+            RotaryAxis::A => 'A',
+            RotaryAxis::Z => 'Z',
+        }
+    }
+}
+
+/// A rotary attachment in place of the Y axis (or on a 4th "A" axis, or the Z output).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Rotary {
@@ -253,13 +286,16 @@ pub struct Rotary {
     pub roller_diameter: f64,
     /// Diameter of the object (chuck type), mm.
     pub object_diameter: f64,
-    /// G-code: the rotary is a 4th axis, so send A instead of Y.
+    /// G-code: the axis the rotary is wired to.
+    pub axis: RotaryAxis,
+    /// Saved by earlier versions: the rotary is on A (now `axis`).
+    #[serde(skip_serializing)]
     pub a_axis: bool,
 }
 
 impl Default for Rotary {
     fn default() -> Self {
-        Self { enabled: false, kind: RotaryKind::Roller, travel_per_rotation: 100.0, roller_diameter: 30.0, object_diameter: 80.0, a_axis: false }
+        Self { enabled: false, kind: RotaryKind::Roller, travel_per_rotation: 100.0, roller_diameter: 30.0, object_diameter: 80.0, axis: RotaryAxis::Y, a_axis: false }
     }
 }
 
@@ -270,6 +306,11 @@ impl Rotary {
             RotaryKind::Roller => self.roller_diameter,
             RotaryKind::Chuck => self.object_diameter,
         }
+    }
+
+    /// The axis the rotary is wired to (settings from earlier versions said only "A or not").
+    pub fn axis(&self) -> RotaryAxis {
+        if self.axis == RotaryAxis::Y && self.a_axis { RotaryAxis::A } else { self.axis }
     }
 
     /// Machine "Y" mm per design mm around the object.
@@ -692,8 +733,9 @@ impl Laser {
             start_gcode: s.start_gcode.clone(),
             end_gcode: s.end_gcode.clone(),
             air_m7: s.air_m7,
-            y_as_a: self.rotary_on_a(),
-            z: s.z_axis.then_some(bc_grbl::ZAxis { relative: s.z_relative, reversed: s.z_reversed }),
+            y_axis: self.rotary_axis().map_or('Y', RotaryAxis::letter),
+            // A rotary on Z takes the Z output, so there are no focus moves then.
+            z: (s.z_axis && self.rotary_axis() != Some(RotaryAxis::Z)).then_some(bc_grbl::ZAxis { relative: s.z_relative, reversed: s.z_reversed }),
         }
     }
 
@@ -703,8 +745,10 @@ impl Laser {
         (r.enabled && matches!(self.settings.controller, ControllerKind::Ruida | ControllerKind::Grbl)).then(|| r.scale())
     }
 
-    fn rotary_on_a(&self) -> bool {
-        self.settings.controller == ControllerKind::Grbl && self.rotary_scale().is_some() && self.settings.rotary.a_axis
+    /// G-code: the axis other than Y that the rotary in use is wired to.
+    fn rotary_axis(&self) -> Option<RotaryAxis> {
+        let axis = self.settings.rotary.axis();
+        (self.settings.controller == ControllerKind::Grbl && self.rotary_scale().is_some() && axis != RotaryAxis::Y).then_some(axis)
     }
 
     /// Design → machine coordinates for `job`, including the rotary stretch about the job's top edge.
@@ -812,8 +856,8 @@ impl Laser {
         let map = self.job_mapper(job, bed)?;
         let (p, q) = (map(a), map(b));
         let (min, max) = ((p.0.min(q.0), p.1.min(q.1)), (p.0.max(q.0), p.1.max(q.1)));
-        if self.rotary_on_a() {
-            // Jogging moves X/Y only, so trace the frame as a laser-off job on X/A.
+        if self.rotary_axis().is_some() {
+            // Jogging moves X/Y only, so trace the frame as a laser-off job on X and the rotary's axis.
             let ring = vec![min, (max.0, min.1), max, (min.0, max.1), min];
             let layer = MachineLayer { speed: self.settings.rapid_speed, min_power: 0.0, max_power: 0.0, air_assist: false, frequency: 30.0, color: [0, 0, 0], raster: false, passes: 1, interval: 0.1, z_offset: 0.0, z_step: 0.0, delay_on: 0.0, delay_off: 0.0, paths: vec![(ring, 0.0)] };
             self.device.send(DeviceCmd::Run(vec![layer]));
@@ -1758,33 +1802,44 @@ impl Laser {
                         ui.end_row();
                     }
                     RotaryKind::Chuck => {
+                        // Either can be typed in (a tape round the object gives the circumference).
                         ui.label("Object diameter");
                         ui.add(egui::DragValue::new(&mut r.object_diameter).range(1.0..=1000.0).speed(0.1).suffix(" mm"));
                         ui.end_row();
                         ui.label("Circumference");
-                        ui.label(format!("{:.1} mm", r.surface_per_turn()));
+                        let mut around = r.object_diameter * std::f64::consts::PI;
+                        if ui.add(egui::DragValue::new(&mut around).range(3.2..=3142.0).speed(0.3).max_decimals(2).suffix(" mm")).on_hover_text("The distance round the object, e.g. measured with a tape").changed() {
+                            r.object_diameter = around / std::f64::consts::PI;
+                        }
                         ui.end_row();
                     }
                 }
                 if gcode {
                     ui.label("Axis");
                     ui.horizontal(|ui| {
-                        ui.radio_value(&mut r.a_axis, false, "Replaces Y");
-                        ui.radio_value(&mut r.a_axis, true, "A axis (4th axis)");
+                        let mut axis = r.axis();
+                        for a in RotaryAxis::ALL {
+                            ui.radio_value(&mut axis, a, a.label());
+                        }
+                        (r.axis, r.a_axis) = (axis, false);
                     });
                     ui.end_row();
                 }
             });
+            if gcode && r.axis() == RotaryAxis::Z && self.settings.z_axis {
+                ui.colored_label(ui.visuals().warn_fg_color, "The Z axis is in use by the rotary, so layers' Z offsets and steps aren't sent while the rotary is on.");
+            }
             ui.weak(match r.kind {
                 RotaryKind::Roller => "Roller: the design's height wraps around the object; the object size doesn't matter.",
                 RotaryKind::Chuck => "Chuck: set the object's diameter at the spot being engraved.",
             });
             ui.separator();
-            let (travel, a_axis) = (r.travel_per_rotation, r.a_axis && gcode);
+            let r = &self.settings.rotary;
+            let (travel, axis) = (r.travel_per_rotation, if gcode { r.axis() } else { RotaryAxis::Y });
             ui.horizontal(|ui| {
                 if ui.add_enabled(connected, egui::Button::new("Rotate once")).on_hover_text("Turns the rotary one full revolution (laser off). It should end exactly where it started.").clicked() {
-                    if a_axis {
-                        for line in ["G91", &format!("G0 A{travel:.3}"), "G90"] {
+                    if axis != RotaryAxis::Y {
+                        for line in ["G91", &format!("G0 {}{travel:.3}", axis.letter()), "G90"] {
                             self.device.send(DeviceCmd::Console(line.to_string()));
                         }
                     } else {

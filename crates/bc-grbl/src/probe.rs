@@ -13,6 +13,8 @@ pub struct Found {
     pub dialect: Dialect,
     /// What the board called itself, e.g. "Grbl 1.1h".
     pub info: String,
+    /// GRBL: how far the head can travel (mm), from `$130` and `$131`.
+    pub travel: Option<(f64, f64)>,
 }
 
 /// Speeds tried, most common first (460800 for LaserPecker and some ESP32 boards).
@@ -46,6 +48,54 @@ pub fn identify(text: &str) -> Option<(Dialect, String)> {
     None
 }
 
+/// The X and Y travel (mm) in GRBL's settings listing (`$130=381.000`, `$131=305.000`).
+pub fn travel(text: &str) -> Option<(f64, f64)> {
+    let value = |key: &str| {
+        text.lines().map(str::trim).find_map(|l| l.strip_prefix(key)).and_then(|v| v.split(|c: char| c.is_whitespace() || c == '(').next()?.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0)
+    };
+    Some((value("$130=")?, value("$131=")?))
+}
+
+/// Asks a GRBL board for its settings (`$$`) and reads its travel from them.
+fn ask_travel(serial: &mut Box<dyn serialport::SerialPort>) -> Option<(f64, f64)> {
+    let _ = serial.write_all(b"$$\n");
+    let _ = serial.flush();
+    let start = Instant::now();
+    let mut heard = Vec::new();
+    while start.elapsed() < LISTEN {
+        let mut buf = [0u8; 512];
+        match serial.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                heard.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&heard);
+                if text.contains("$131=") && text.lines().any(|l| l.trim() == "ok") {
+                    break;
+                }
+            }
+            _ => crate::stream::nothing_read(),
+        }
+    }
+    travel(&String::from_utf8_lossy(&heard))
+}
+
+/// Reads a GRBL board's travel (mm, from `$130` and `$131`) on `port`. Opening the port resets
+/// most boards, so this waits for it to start before asking.
+pub fn read_travel(port: &str, baud: u32) -> Result<(f64, f64), String> {
+    let mut serial = serialport::new(port, baud).timeout(Duration::from_millis(50)).open().map_err(|e| open_error(&e))?;
+    let _ = serial.write_data_terminal_ready(true);
+    // Let a board that resets on opening finish starting (it greets when it's ready).
+    let start = Instant::now();
+    let mut heard = Vec::new();
+    while start.elapsed() < LISTEN && identify(&String::from_utf8_lossy(&heard)).is_none() {
+        let mut buf = [0u8; 256];
+        match serial.read(&mut buf) {
+            Ok(n) if n > 0 => heard.extend_from_slice(&buf[..n]),
+            _ => crate::stream::nothing_read(),
+        }
+    }
+    ask_travel(&mut serial).ok_or_else(|| "the controller didn't report its travel ($130 and $131). Is it a GRBL board, at this baud rate?".to_string())
+}
+
 /// Tries each speed on `port` and returns the controller found, if any. Opening a port resets
 /// most Arduino-style boards, which then greet; others are asked who they are. An error means the
 /// port couldn't be opened at all (busy, gone, or no permission).
@@ -74,7 +124,9 @@ pub fn probe(port: &str) -> Result<Option<Found>, String> {
                 Ok(n) if n > 0 => {
                     heard.extend_from_slice(&buf[..n]);
                     if let Some((dialect, info)) = identify(&String::from_utf8_lossy(&heard)) {
-                        return Ok(Some(Found { port: port.to_string(), baud, dialect, info }));
+                        // GRBL also says how far it can travel.
+                        let travel = if dialect == Dialect::Grbl { ask_travel(&mut serial) } else { None };
+                        return Ok(Some(Found { port: port.to_string(), baud, dialect, info, travel }));
                     }
                 }
                 _ => crate::stream::nothing_read(),

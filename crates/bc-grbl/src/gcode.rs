@@ -130,15 +130,16 @@ pub struct GcodeOptions {
     pub end_gcode: String,
     /// Air assist with M7 (mist) instead of M8 (flood).
     pub air_m7: bool,
-    /// Rotary on a 4th axis: write the Y coordinate as A.
-    pub y_as_a: bool,
+    /// The letter the Y coordinate is written as: `Y`, or `A` or `Z` for a rotary wired to
+    /// that axis.
+    pub y_axis: char,
     /// The machine has a Z axis to use for layer offsets and per-pass steps.
     pub z: Option<ZAxis>,
 }
 
 impl Default for GcodeOptions {
     fn default() -> Self {
-        Self { s_max: 1000.0, dialect: Dialect::Grbl, custom: CustomGcode::default(), start_gcode: String::new(), end_gcode: String::new(), air_m7: false, y_as_a: false, z: None }
+        Self { s_max: 1000.0, dialect: Dialect::Grbl, custom: CustomGcode::default(), start_gcode: String::new(), end_gcode: String::new(), air_m7: false, y_axis: 'Y', z: None }
     }
 }
 
@@ -219,7 +220,7 @@ pub fn generate(layers: &[GrblLayer], options: &GcodeOptions) -> Vec<String> {
         Dialect::Custom if c.inline_power => out.push(format!("{} S0", c.laser_on)),
         _ => {}
     }
-    let y_letter = if options.y_as_a { 'A' } else { 'Y' };
+    let y_letter = options.y_axis;
     let s_text = |s: f64| if d == Dialect::Smoothieware { format!("{:.3}", s) } else { format!("{}", s.round() as i64) };
     let mut feed: Option<i64> = None;
     let mut s_value: Option<String> = None;

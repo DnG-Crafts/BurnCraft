@@ -1545,6 +1545,9 @@ impl BurnCraftApp {
         for c in [Group, Ungroup, Lock, Unlock] {
             self.command_item(ui, c);
         }
+        if !self.selection.is_empty() {
+            ui.menu_button("Move to Layer", |ui| self.move_to_layer_menu(ui));
+        }
         ui.separator();
         ui.menu_button("Arrange", |ui| {
             for c in [Order(edit::Order::ToFront), Order(edit::Order::ToBack), Mirror(true), Mirror(false), Rotate(90.0), Rotate(-90.0)] {
@@ -1568,6 +1571,33 @@ impl BurnCraftApp {
         }
         ui.separator();
         self.command_item(ui, ZoomToSelection);
+    }
+
+    /// The right-click menu's "Move to Layer": the palette's layers by colour (the selection's own
+    /// ticked), and a new layer.
+    fn move_to_layer_menu(&mut self, ui: &mut egui::Ui) {
+        let on: BTreeSet<usize> = self.doc.shapes.iter().filter(|s| self.selection.contains(&s.id)).map(|s| s.layer).collect();
+        for i in self.doc.palette_layers() {
+            let layer = &self.doc.layers[i];
+            let name = if layer.name.trim().is_empty() { layer.mode.label().to_string() } else { layer.name.clone() };
+            let mut clicked = false;
+            ui.horizontal(|ui| {
+                clicked |= crate::panels::swatch(ui, i, layer.rgb(i), 16.0).clicked();
+                let text = if on.contains(&i) { format!("✓ {name}") } else { name };
+                clicked |= ui.selectable_label(false, text).clicked();
+            });
+            if clicked {
+                self.assign_layer(i);
+                ui.close();
+            }
+        }
+        ui.separator();
+        let free = self.doc.next_free_layer().is_some();
+        if ui.add_enabled(free, egui::Button::new("New layer")).on_hover_text("Add a layer in a new colour and move the selection to it").on_disabled_hover_text(format!("All {} layers are in use", CUT_LAYER_COUNT)).clicked() {
+            self.add_layer();
+            self.assign_layer(self.current_layer);
+            ui.close();
+        }
     }
 
     /// The Settings window (view and editing preferences).
